@@ -4531,3 +4531,21 @@ test('catalogPrune overrides its former name', async () => {
 
   expect(config.catalogPrune).toBe(false)
 })
+
+test('verifyDepsBeforeRun can be set via env variable', async () => {
+  prepare()
+
+  const { config } = await getConfig({
+    cliOptions: {},
+    env: {
+      ...env,
+      PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: 'error',
+    },
+    packageManager: {
+      name: 'pnpm',
+      version: '1.0.0',
+    },
+  })
+
+  expect(config.verifyDepsBeforeRun).toBe('error')
+})
