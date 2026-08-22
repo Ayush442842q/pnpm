@@ -9,7 +9,7 @@ import { PnpmError } from '@pnpm/error'
 import { scanGlobalPackages } from '@pnpm/global.packages'
 import { install } from '@pnpm/installing.commands'
 import { type Modules, writeModulesManifest } from '@pnpm/installing.modules-yaml'
-import { globalInfo } from '@pnpm/logger'
+import { globalInfo, globalWarn } from '@pnpm/logger'
 import { lexCompare } from '@pnpm/text.ordinal-comparator'
 import { readWorkspaceManifest } from '@pnpm/workspace.workspace-manifest-reader'
 import chalk from 'chalk'
@@ -85,7 +85,7 @@ export async function handler (opts: ApproveBuildsCommandOpts & RebuildCommandOp
   }
   const targets = await getApprovalTargets(opts)
   const automaticallyIgnoredBuilds = sortUniqueStrings(targets.flatMap((target) => target.automaticallyIgnoredBuilds ?? []))
-  if (!automaticallyIgnoredBuilds.length) {
+  if (!automaticallyIgnoredBuilds.length && !params.length) {
     globalInfo('There are no packages awaiting approval')
     return
   }
@@ -96,17 +96,15 @@ export async function handler (opts: ApproveBuildsCommandOpts & RebuildCommandOp
     const name = p.startsWith('!') ? p.slice(1) : p
     if (!automaticallyIgnoredBuilds.includes(name)) {
       unknown.push(name)
-    } else if (p.startsWith('!')) {
+    }
+    if (p.startsWith('!')) {
       denied.push(name)
     } else {
       approved.push(name)
     }
   }
   if (unknown.length) {
-    throw new PnpmError(
-      'APPROVE_BUILDS_UNKNOWN_PACKAGES',
-      `The following packages are not awaiting approval: ${unknown.join(', ')}`
-    )
+    globalWarn(`The following packages are not awaiting approval: ${unknown.join(', ')}`)
   }
   const contradictions = approved.filter((p) => denied.includes(p))
   if (contradictions.length) {
