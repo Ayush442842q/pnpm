@@ -364,13 +364,12 @@ impl AuditArgs {
             return Ok(AuditOutcome::Clean);
         }
 
-        let total_vulnerability_count = report.metadata.vulnerabilities.total();
         let ignored = filter_ignored_advisories(&mut report, state.config);
 
         let output = if self.json {
             render_json_report(&report, audit_level)?
         } else {
-            render_text_report(&report, audit_level, total_vulnerability_count, &ignored)
+            render_text_report(&report, audit_level, &ignored)
         };
         print_command_output(&output);
 
@@ -670,16 +669,6 @@ fn filter_ignored_advisories(
         false
     });
     ignored
-}
-
-fn count_for_level(counts: &AuditVulnerabilityCounts, level: ConfigAuditLevel) -> usize {
-    match level {
-        ConfigAuditLevel::Info => counts.info,
-        ConfigAuditLevel::Low => counts.low,
-        ConfigAuditLevel::Moderate => counts.moderate,
-        ConfigAuditLevel::High => counts.high,
-        ConfigAuditLevel::Critical => counts.critical,
-    }
 }
 
 fn parse_audit_level(value: &str) -> Option<ConfigAuditLevel> {
