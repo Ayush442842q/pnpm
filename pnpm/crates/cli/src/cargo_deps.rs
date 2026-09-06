@@ -1,7 +1,8 @@
 use crate::ecosystem_install::{EcosystemManifest, EcosystemWorkspaceInventory, InstallContext};
+use cargo_util_schemas::index::RegistryConfig;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use miette::{IntoDiagnostic, Result, WrapErr};
-use pnpm_cargo_resolver::CRATES_IO_SPARSE_INDEX;
+use pnpm_cargo_resolver::is_crates_io;
 use pnpm_config::Config;
 use pnpm_deps_restorer::{ImportIndexedDirOpts, import_indexed_dir};
 use pnpm_install_coordinator::{InstallTask, PreparedInstall};
@@ -29,8 +30,12 @@ mod registry_auth;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const CRATES_IO_DOWNLOAD_BASE: &str = "https://static.crates.io/crates";
 const WORKSPACE_INSTALL_CONCURRENCY: usize = 8;
+const CRATES_IO_DOWNLOAD_BASE: &str = "https://static.crates.io/crates";
+/// A registry's `config.json` holds a download template and two URLs. The
+/// cap keeps a registry the workspace names from spending the client's
+/// memory and cache before the document is even parsed.
+const MAX_REGISTRY_CONFIG_BYTES: usize = 64 * 1024;
 const MANAGED_START: &str = "# >>> pnpm-managed cargo sources >>>";
 const MANAGED_END: &str = "# <<< pnpm-managed cargo sources <<<";
 const MANAGED_CONFIG: &str = "# >>> pnpm-managed cargo sources >>>\n[source.crates-io]\nreplace-with = \"pnpm-crates-io\"\n\n[source.pnpm-crates-io]\ndirectory = \".pnpm/crates/crates-io\"\n# <<< pnpm-managed cargo sources <<<";
@@ -120,13 +125,14 @@ pub(crate) struct Prepared {
     root: PathBuf,
     lock: String,
     slots: Option<Vec<(String, PathBuf)>>,
+    index_url: String,
 }
 
 impl PreparedInstall for Prepared {
     fn publish(&mut self) -> Result<()> {
         if let Some(slots) = &self.slots {
             link_workspace(&self.root, slots)?;
-            write_cargo_config(&self.root)?;
+            write_cargo_config(&self.root, &self.index_url)?;
         }
         let path = self.root.join("Cargo.lock");
         let existing = match fs::read_to_string(&path) {
@@ -170,10 +176,23 @@ async fn prepare_workspace<Reporter: self::Reporter + 'static>(
     )
     .await?;
     if lockfile_only {
-        return Ok(Prepared { root: root_dir.to_path_buf(), lock: cargo_lock, slots: None });
+        return Ok(Prepared {
+            root: root_dir.to_path_buf(),
+            lock: cargo_lock,
+            slots: None,
+            index_url: config.cargo.index_url.clone(),
+        });
     }
-    let packages = parse_lockfile(&cargo_lock)
+    let packages = parse_lockfile(&cargo_lock, &config.cargo.index_url)
         .wrap_err_with(|| format!("parse {}", cargo_lock_path.display()))?;
+    if packages.is_empty() {
+        return Ok(Prepared {
+            root: root_dir.to_path_buf(),
+            lock: cargo_lock,
+            slots: Some(Vec::new()),
+            index_url: config.cargo.index_url.clone(),
+        });
+    }
     let store_dir = &config.store_dir;
     store_dir
         .init()
@@ -183,7 +202,9 @@ async fn prepare_workspace<Reporter: self::Reporter + 'static>(
     let (store_index_writer, writer_task) =
         StoreIndexWriter::spawn_for(store_dir, config.frozen_store);
 
-    let auth_headers = Arc::clone(&config.auth_headers);
+    let cargo_auth_headers = cargo_auth_headers(config)?;
+    let registry_config = fetch_registry_config(config, &http_client, &cargo_auth_headers).await?;
+    let auth_headers = download_auth_headers(config, &registry_config);
     let verified_files_cache = SharedVerifiedFilesCache::default();
     let logged_methods = Arc::new(AtomicU8::new(0));
     let retry_opts = config.retry_opts();
@@ -199,6 +220,7 @@ async fn prepare_workspace<Reporter: self::Reporter + 'static>(
                 store_index_writer: Arc::clone(&store_index_writer),
                 http_client: Arc::clone(&http_client),
                 auth_headers: Arc::clone(&auth_headers),
+                download_template: registry_config.dl.clone(),
                 verified_files_cache: Arc::clone(&verified_files_cache),
                 logged_methods: Arc::clone(&logged_methods),
                 package_import_method: config.package_import_method,
@@ -218,7 +240,12 @@ async fn prepare_workspace<Reporter: self::Reporter + 'static>(
     StoreIndexWriter::drain(writer_task, "; some Cargo rows may not be persisted").await;
     let slots = slots?;
 
-    Ok(Prepared { root: root_dir.to_path_buf(), lock: cargo_lock, slots: Some(slots) })
+    Ok(Prepared {
+        root: root_dir.to_path_buf(),
+        lock: cargo_lock,
+        slots: Some(slots),
+        index_url: config.cargo.index_url.clone(),
+    })
 }
 
 pub(crate) async fn workspace_root(manifest_path: &Path) -> Result<PathBuf> {
@@ -268,7 +295,8 @@ async fn read_or_resolve_lockfile(
         return Ok(lockfile);
     }
     let index_files = fetch_sparse_index(config, &metadata, http_client).await?;
-    let lockfile = pnpm_cargo_resolver::resolve_lockfile(&metadata, &index_files)
+    let source = pnpm_cargo_resolver::registry_source(&config.cargo.index_url);
+    let lockfile = pnpm_cargo_resolver::resolve_lockfile(&metadata, &index_files, &source)
         .wrap_err("resolve Cargo dependencies")?;
     Ok(lockfile)
 }
@@ -302,7 +330,7 @@ async fn resolve_via_pnpr(config: &Config, metadata: &str) -> Result<Option<Stri
     client
         .resolve_cargo(CargoResolveOptions {
             metadata,
-            registry: CRATES_IO_SPARSE_INDEX.to_string(),
+            registry: config.cargo.index_url.clone(),
             authorization: config.auth_headers.for_url(pnpr_server),
         })
         .await
@@ -317,10 +345,10 @@ pub(crate) async fn latest_version(
     name: &str,
     http_client: &ThrottledClient,
 ) -> Result<String> {
-    let cache_dir = config.cache_dir.join("v11").join("cargo-index").join("crates-io");
+    let cache_dir = cargo_index_cache_dir(config);
     let index_file = fetch_sparse_index_file(
         name,
-        CRATES_IO_SPARSE_INDEX,
+        &config.cargo.index_url,
         &cache_dir,
         http_client,
         auth_headers,
@@ -332,8 +360,58 @@ pub(crate) async fn latest_version(
         .wrap_err_with(|| format!("select the latest version of crate {name}"))
 }
 
-pub(crate) fn crates_io_auth_headers(config: &Config) -> Result<Arc<AuthHeaders>> {
-    registry_auth::crates_io::<pnpm_config::Host>(&config.auth_headers, config.offline)
+/// The credentials a crate archive download may carry.
+///
+/// `cargo.indexUrl` is repository-selected and its `config.json` names the
+/// download host, so the only credential that may travel is the one
+/// configured for the registry itself, never one looked up by the host the
+/// registry names. Off the registry's own origin it travels only when the
+/// registry sets `auth-required`, which is the same condition under which
+/// `cargo` sends its own token. Either way it travels only over TLS or
+/// loopback.
+///
+/// A Cargo install runs from the CLI, which installs no route hook, so the
+/// anonymous headers deny nothing a hook would have allowed.
+fn download_auth_headers(config: &Config, registry_config: &RegistryConfig) -> Arc<AuthHeaders> {
+    // The registry serves its own downloads: every credential configured
+    // for it applies to them as it does to its index.
+    if same_origin(&registry_config.dl, &config.cargo.index_url) {
+        return Arc::new((*config.auth_headers).clone().with_secure_transport());
+    }
+    let credential = registry_config
+        .auth_required
+        .then(|| config.auth_headers.for_secure_url(&config.cargo.index_url))
+        .flatten();
+    let Some((credential, origin)) = credential.zip(origin_of(&registry_config.dl)) else {
+        return Arc::new(AuthHeaders::default());
+    };
+    let mut auth_headers = AuthHeaders::default().with_secure_transport();
+    auth_headers.insert_url_header(&origin, credential);
+    Arc::new(auth_headers)
+}
+
+/// Whether both URLs are absolute and share a scheme, host, and port. A URL
+/// that does not parse, or whose scheme has no host, matches nothing.
+fn same_origin(left: &str, right: &str) -> bool {
+    match (origin_of(left), origin_of(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// `scheme://host:port` of an absolute URL whose scheme has a host. `None`
+/// for anything else, including a download template that is a bare path.
+fn origin_of(url: &str) -> Option<String> {
+    let origin = url::Url::parse(url).ok()?.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+pub(crate) fn cargo_auth_headers(config: &Config) -> Result<Arc<AuthHeaders>> {
+    if is_crates_io(&config.cargo.index_url) {
+        registry_auth::crates_io::<pnpm_config::Host>(&config.auth_headers, config.offline)
+    } else {
+        Ok(Arc::clone(&config.auth_headers))
+    }
 }
 
 async fn read_cargo_metadata(root_dir: &Path) -> Result<String> {
@@ -369,12 +447,13 @@ async fn fetch_sparse_index(
     metadata: &str,
     http_client: &Arc<ThrottledClient>,
 ) -> Result<BTreeMap<String, String>> {
-    let auth_headers = crates_io_auth_headers(config)?;
-    let cache_dir = config.cache_dir.join("v11").join("cargo-index").join("crates-io");
+    let auth_headers = cargo_auth_headers(config)?;
+    let cache_dir = cargo_index_cache_dir(config);
+    let source = pnpm_cargo_resolver::registry_source(&config.cargo.index_url);
     let mut index_files = BTreeMap::new();
 
     loop {
-        let missing = pnpm_cargo_resolver::missing_index_names(metadata, &index_files)
+        let missing = pnpm_cargo_resolver::missing_index_names(metadata, &index_files, &source)
             .wrap_err("discover Cargo sparse-index files")?;
         if missing.is_empty() {
             return Ok(index_files);
@@ -387,7 +466,7 @@ async fn fetch_sparse_index(
                 async move {
                     let contents = fetch_sparse_index_file(
                         &name,
-                        CRATES_IO_SPARSE_INDEX,
+                        &config.cargo.index_url,
                         &cache_dir,
                         &http_client,
                         &auth_headers,
@@ -403,6 +482,72 @@ async fn fetch_sparse_index(
             .await?;
         index_files.extend(fetched);
     }
+}
+
+fn cargo_index_cache_dir(config: &Config) -> PathBuf {
+    let registry = if is_crates_io(&config.cargo.index_url) {
+        "crates-io".to_string()
+    } else {
+        pnpm_crypto_hash::create_hex_hash(config.cargo.index_url.trim_end_matches('/'))
+    };
+    config.cache_dir.join("v11").join("cargo-index").join(registry)
+}
+
+async fn fetch_registry_config(
+    config: &Config,
+    http_client: &ThrottledClient,
+    auth_headers: &AuthHeaders,
+) -> Result<RegistryConfig> {
+    if is_crates_io(&config.cargo.index_url) {
+        return Ok(RegistryConfig {
+            dl: CRATES_IO_DOWNLOAD_BASE.to_string(),
+            api: Some("https://crates.io".to_string()),
+            auth_required: false,
+        });
+    }
+    let cache_path = cargo_index_cache_dir(config).join(RegistryConfig::NAME);
+    let bytes = if config.offline {
+        fs::read(&cache_path).into_diagnostic().wrap_err_with(|| {
+            format!("read cached Cargo registry config at {}", cache_path.display())
+        })?
+    } else {
+        let url =
+            format!("{}/{}", config.cargo.index_url.trim_end_matches('/'), RegistryConfig::NAME);
+        let response = http_client
+            .get_limited_bytes_with_secure_auth_and_retry(
+                &url,
+                auth_headers,
+                None,
+                config.retry_opts(),
+                MAX_REGISTRY_CONFIG_BYTES,
+            )
+            .await
+            .into_diagnostic()
+            .wrap_err_with(|| format!("fetch Cargo registry config from {url}"))?;
+        if !response.status.is_success() {
+            return Err(miette::miette!(
+                "fetch Cargo registry config returned HTTP {}",
+                response.status,
+            ));
+        }
+        if response.body_truncated {
+            return Err(miette::miette!(
+                "Cargo registry config at {url} is larger than {MAX_REGISTRY_CONFIG_BYTES} bytes",
+            ));
+        }
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("create Cargo registry cache at {}", parent.display()))?;
+        }
+        pnpm_fs::write_atomic(&cache_path, &response.body)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cache Cargo registry config at {}", cache_path.display()))?;
+        response.body
+    };
+    serde_json::from_slice(&bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("parse Cargo registry config from {}", cache_path.display()))
 }
 
 async fn fetch_sparse_index_file(
@@ -468,6 +613,7 @@ struct MaterializeOptions {
     store_index_writer: Arc<StoreIndexWriter>,
     http_client: Arc<ThrottledClient>,
     auth_headers: Arc<AuthHeaders>,
+    download_template: String,
     verified_files_cache: SharedVerifiedFilesCache,
     logged_methods: Arc<AtomicU8>,
     package_import_method: pnpm_config::PackageImportMethod,
@@ -488,6 +634,7 @@ async fn materialize<Reporter: self::Reporter + 'static>(
         store_index_writer,
         http_client,
         auth_headers,
+        download_template,
         verified_files_cache,
         logged_methods,
         package_import_method,
@@ -499,9 +646,11 @@ async fn materialize<Reporter: self::Reporter + 'static>(
     } = options;
     let link_name = package.link_name();
     let slot = package.store_slot(store_dir.root());
-    let package_url = format!(
-        "{CRATES_IO_DOWNLOAD_BASE}/{}/{}-{}.crate",
-        package.name, package.name, package.version,
+    let package_url = pnpm_cargo_resolver::download_url(
+        &download_template,
+        &package.name,
+        &package.version,
+        &package.checksum,
     );
     let package_id = format!("crate:{}@{}", package.name, package.version);
     let integrity = Integrity::from_hex(&package.checksum, Algorithm::Sha256)
@@ -601,12 +750,12 @@ fn link_workspace_in(source_dir: &ManagedDirectory, slots: &[(String, PathBuf)])
     Ok(())
 }
 
-fn write_cargo_config(root_dir: &Path) -> Result<()> {
+fn write_cargo_config(root_dir: &Path, index_url: &str) -> Result<()> {
     let cargo_dir = ensure_workspace_directory(root_dir, &[".cargo"])?;
-    write_cargo_config_in(&cargo_dir)
+    write_cargo_config_in(&cargo_dir, index_url)
 }
 
-fn write_cargo_config_in(cargo_dir: &ManagedDirectory) -> Result<()> {
+fn write_cargo_config_in(cargo_dir: &ManagedDirectory, index_url: &str) -> Result<()> {
     let config_path = cargo_dir.path.join("config.toml");
     let (existing, mode) = match read_workspace_file(cargo_dir, "config.toml") {
         Ok(existing) => existing,
@@ -617,7 +766,7 @@ fn write_cargo_config_in(cargo_dir: &ManagedDirectory) -> Result<()> {
                 .wrap_err_with(|| format!("read {}", config_path.display()));
         }
     };
-    let updated = update_managed_config(&existing)?;
+    let updated = update_managed_config(&existing, index_url)?;
     if updated != existing {
         write_workspace_file(cargo_dir, "config.toml", updated.as_bytes(), mode)
             .into_diagnostic()
@@ -1035,7 +1184,8 @@ fn force_workspace_symlink(
     pnpm_fs::force_symlink_dir(target, &directory.path.join(name))
 }
 
-fn update_managed_config(existing: &str) -> Result<String> {
+fn update_managed_config(existing: &str, index_url: &str) -> Result<String> {
+    let managed_config = managed_config(index_url);
     match (existing.find(MANAGED_START), existing.find(MANAGED_END)) {
         (None, None) => {
             let separator = if existing.is_empty() || existing.ends_with("\n\n") {
@@ -1045,11 +1195,11 @@ fn update_managed_config(existing: &str) -> Result<String> {
             } else {
                 "\n\n"
             };
-            Ok(format!("{existing}{separator}{MANAGED_CONFIG}\n"))
+            Ok(format!("{existing}{separator}{managed_config}\n"))
         }
         (Some(start), Some(end)) if start <= end => {
             let after = end + MANAGED_END.len();
-            Ok(format!("{}{}{}", &existing[..start], MANAGED_CONFIG, &existing[after..]))
+            Ok(format!("{}{}{}", &existing[..start], managed_config, &existing[after..]))
         }
         _ => Err(miette::miette!(
             ".cargo/config.toml contains an incomplete pnpm-managed Cargo source block"
@@ -1057,12 +1207,22 @@ fn update_managed_config(existing: &str) -> Result<String> {
     }
 }
 
-fn parse_lockfile(input: &str) -> Result<Vec<LockedCrate>> {
+fn managed_config(index_url: &str) -> String {
+    if is_crates_io(index_url) {
+        return MANAGED_CONFIG.to_string();
+    }
+    let source = toml::Value::from(pnpm_cargo_resolver::sparse_source(index_url));
+    format!(
+        "{MANAGED_START}\n[source.crates-io]\nreplace-with = \"pnpm-registry\"\n\n[source.pnpm-registry]\nregistry = {source}\nreplace-with = \"pnpm-registry-directory\"\n\n[source.pnpm-registry-directory]\ndirectory = \".pnpm/crates/crates-io\"\n{MANAGED_END}",
+    )
+}
+
+fn parse_lockfile(input: &str, index_url: &str) -> Result<Vec<LockedCrate>> {
     let lockfile =
         cargo_lock::Lockfile::from_str(input).into_diagnostic().wrap_err("parse Cargo.lock")?;
     let mut packages = Vec::new();
     for package in lockfile.packages {
-        if let Some(package) = locked_crate_from_package(package)? {
+        if let Some(package) = locked_crate_from_package(package, index_url)? {
             packages.push(package);
         }
     }
@@ -1080,13 +1240,24 @@ fn parse_lockfile(input: &str) -> Result<Vec<LockedCrate>> {
     Ok(packages)
 }
 
-fn locked_crate_from_package(package: cargo_lock::Package) -> Result<Option<LockedCrate>> {
+fn locked_crate_from_package(
+    package: cargo_lock::Package,
+    index_url: &str,
+) -> Result<Option<LockedCrate>> {
     let Some(source) = package.source.as_ref() else {
         return Ok(None);
     };
-    if !source.is_default_registry() {
+    // crates.io is spelled two ways in a lockfile — the canonical git
+    // identifier and the sparse index — and `cargo` writes either.
+    let expected_source = pnpm_cargo_resolver::registry_source(index_url);
+    let matches_registry = if is_crates_io(index_url) {
+        source.is_default_registry()
+    } else {
+        source.to_string() == expected_source
+    };
+    if !matches_registry {
         return Err(miette::miette!(
-            "Cargo source {source:?} is not supported by the crates.io-only proof of concept"
+            "Cargo source {source:?} does not match the configured Cargo registry {expected_source:?}"
         ));
     }
     let name = package.name.to_string();

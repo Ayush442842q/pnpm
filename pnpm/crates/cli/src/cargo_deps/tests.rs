@@ -1,8 +1,11 @@
 use super::{
-    ArchiveStoreProjection, CRATES_IO_SPARSE_INDEX, Config, LockedCrate, MANAGED_CONFIG,
-    MaterializeOptions, add_cargo_checksum, fetch_sparse_index_file, materialize, parse_lockfile,
-    resolve_via_pnpr, sparse_index_path, update_managed_config, workspace_root,
+    ArchiveStoreProjection, Config, LockedCrate, MANAGED_CONFIG, MaterializeOptions,
+    add_cargo_checksum, download_auth_headers, fetch_sparse_index_file, managed_config,
+    materialize, parse_lockfile, resolve_via_pnpr, sparse_index_path, update_managed_config,
+    workspace_root,
 };
+use cargo_util_schemas::index::RegistryConfig;
+use pnpm_cargo_resolver::CRATES_IO_SPARSE_INDEX;
 use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient};
 use pnpm_reporter::SilentReporter;
 use pnpm_store_dir::{
@@ -46,7 +49,7 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 "#;
 
     assert_eq!(
-        parse_lockfile(lockfile).unwrap(),
+        parse_lockfile(lockfile, CRATES_IO_SPARSE_INDEX).unwrap(),
         vec![LockedCrate {
             name: "serde".to_string(),
             version: "1.0.228".to_string(),
@@ -66,8 +69,58 @@ source = "registry+https://registry.example/index"
 checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 "#;
 
-    let error = parse_lockfile(lockfile).unwrap_err().to_string();
-    assert!(error.contains("crates.io-only proof of concept"), "{error}");
+    let error = parse_lockfile(lockfile, CRATES_IO_SPARSE_INDEX).unwrap_err().to_string();
+    assert!(error.contains("does not match the configured Cargo registry"), "{error}");
+}
+
+#[test]
+fn rejects_a_crates_io_source_under_a_configured_registry() {
+    let lockfile = r#"
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
+"#;
+
+    let error =
+        parse_lockfile(lockfile, "https://registry.example.test/index/").unwrap_err().to_string();
+
+    assert!(error.contains("does not match the configured Cargo registry"), "{error}");
+}
+
+#[test]
+fn accepts_the_configured_registry_source() {
+    let lockfile = r#"
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "sparse+https://registry.example.test/index/"
+checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
+"#;
+
+    assert_eq!(
+        parse_lockfile(lockfile, "https://registry.example.test/index/").unwrap(),
+        vec![LockedCrate {
+            name: "serde".to_string(),
+            version: "1.0.228".to_string(),
+            checksum: "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
+                .to_string(),
+        }],
+    );
+}
+
+#[test]
+fn accepts_the_sparse_spelling_of_crates_io() {
+    let lockfile = r#"
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "sparse+https://index.crates.io/"
+checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
+"#;
+
+    assert_eq!(parse_lockfile(lockfile, CRATES_IO_SPARSE_INDEX).unwrap().len(), 1);
 }
 
 #[test]
@@ -88,7 +141,7 @@ source = "registry+https://registry.example/index"
 "#;
 
     assert_eq!(
-        parse_lockfile(lockfile).unwrap(),
+        parse_lockfile(lockfile, CRATES_IO_SPARSE_INDEX).unwrap(),
         vec![LockedCrate {
             name: "serde".to_string(),
             version: "1.0.228".to_string(),
@@ -119,7 +172,7 @@ fn crate_store_slots_are_grouped_by_name_version_and_content() {
 #[test]
 fn appends_the_managed_config_without_changing_user_settings() {
     let existing = "[alias]\ncodecov = \"llvm-cov\"\n";
-    let updated = update_managed_config(existing).unwrap();
+    let updated = update_managed_config(existing, CRATES_IO_SPARSE_INDEX).unwrap();
 
     assert_eq!(updated, format!("{existing}\n{MANAGED_CONFIG}\n"));
 }
@@ -127,15 +180,38 @@ fn appends_the_managed_config_without_changing_user_settings() {
 #[test]
 fn replaces_only_the_existing_managed_config() {
     let existing = "before\n# >>> pnpm-managed cargo sources >>>\nstale\n# <<< pnpm-managed cargo sources <<<\nafter\n";
-    let updated = update_managed_config(existing).unwrap();
+    let updated = update_managed_config(existing, CRATES_IO_SPARSE_INDEX).unwrap();
 
     assert_eq!(updated, format!("before\n{MANAGED_CONFIG}\nafter\n"));
 }
 
 #[test]
+fn configures_the_selected_sparse_registry_as_the_vendored_source() {
+    let config = managed_config("https://registry.example.test/index/");
+
+    assert!(config.contains("[source.crates-io]\nreplace-with = \"pnpm-registry\""));
+    assert!(config.contains("[source.pnpm-registry]"));
+    assert!(config.contains(r#"registry = "sparse+https://registry.example.test/index/""#));
+    assert!(config.contains(r#"replace-with = "pnpm-registry-directory""#));
+}
+
+#[test]
+fn escapes_a_registry_url_that_is_not_a_bare_toml_string() {
+    let config = managed_config("https://registry.example.test/o'brien/index");
+
+    let parsed: toml::Table = toml::from_str(&config).expect("managed config is valid TOML");
+    assert_eq!(
+        parsed["source"]["pnpm-registry"]["registry"].as_str(),
+        Some("sparse+https://registry.example.test/o'brien/index/"),
+    );
+}
+
+#[test]
 fn rejects_an_incomplete_managed_config() {
     let error =
-        update_managed_config("# >>> pnpm-managed cargo sources >>>\n").unwrap_err().to_string();
+        update_managed_config("# >>> pnpm-managed cargo sources >>>\n", CRATES_IO_SPARSE_INDEX)
+            .unwrap_err()
+            .to_string();
 
     assert!(error.contains("incomplete"), "{error}");
 }
@@ -242,6 +318,7 @@ async fn repairs_a_preseeded_slot_from_verified_store_metadata() {
         store_index_writer: Arc::clone(&store_index_writer),
         http_client: Arc::new(ThrottledClient::default()),
         auth_headers: Arc::new(AuthHeaders::default()),
+        download_template: "https://static.crates.io/crates".to_string(),
         verified_files_cache: SharedVerifiedFilesCache::default(),
         logged_methods: Arc::new(AtomicU8::new(0)),
         package_import_method: pnpm_config::PackageImportMethod::default(),
@@ -274,6 +351,72 @@ fn maps_crate_names_to_sparse_index_paths() {
     assert_eq!(sparse_index_path("ab").unwrap(), "2/ab");
     assert_eq!(sparse_index_path("abc").unwrap(), "3/a/abc");
     assert_eq!(sparse_index_path("Serde_JSON").unwrap(), "se/rd/serde_json");
+}
+
+fn config_with_cargo_credentials(index_url: &str) -> Config {
+    let mut config = Config::new();
+    config.cargo.index_url = index_url.to_string();
+    config.auth_headers = Arc::new(AuthHeaders::from_creds_map([
+        ("//registry.example.test/".to_string(), "Bearer crate-token".to_string()),
+        ("//cdn.example.test/".to_string(), "Bearer unrelated-token".to_string()),
+        ("//127.0.0.1:4873/".to_string(), "Bearer local-token".to_string()),
+    ]));
+    config
+}
+
+fn registry_config(dl: &str, auth_required: bool) -> RegistryConfig {
+    RegistryConfig { dl: dl.to_string(), api: None, auth_required }
+}
+
+#[test]
+fn crate_downloads_keep_credentials_off_plaintext_hosts() {
+    let config = config_with_cargo_credentials("https://registry.example.test/index/");
+    let auth_headers =
+        download_auth_headers(&config, &registry_config("https://registry.example.test/dl", false));
+
+    assert_eq!(
+        auth_headers.for_url_with_package("https://registry.example.test/dl/demo/1.0.0", None),
+        Some("Bearer crate-token".to_string()),
+    );
+    assert_eq!(
+        auth_headers.for_url_with_package("http://registry.example.test/dl/demo/1.0.0", None),
+        None,
+    );
+}
+
+#[test]
+fn a_registry_on_loopback_still_authenticates_its_downloads() {
+    let config = config_with_cargo_credentials("http://127.0.0.1:4873/index/");
+    let auth_headers =
+        download_auth_headers(&config, &registry_config("http://127.0.0.1:4873/dl", false));
+
+    assert_eq!(
+        auth_headers.for_url_with_package("http://127.0.0.1:4873/dl/demo/1.0.0", None),
+        Some("Bearer local-token".to_string()),
+    );
+}
+
+#[test]
+fn an_unauthenticated_archive_host_carries_no_credential() {
+    let config = config_with_cargo_credentials("https://registry.example.test/index/");
+    let auth_headers =
+        download_auth_headers(&config, &registry_config("https://cdn.example.test/{crate}", false));
+
+    assert_eq!(auth_headers.for_url_with_package("https://cdn.example.test/demo", None), None);
+    assert!(auth_headers.allows_fetch("https://cdn.example.test/demo"));
+}
+
+#[test]
+fn an_authenticated_archive_host_carries_the_credential_of_the_registry() {
+    let config = config_with_cargo_credentials("https://registry.example.test/index/");
+    let auth_headers =
+        download_auth_headers(&config, &registry_config("https://cdn.example.test/{crate}", true));
+
+    // The registry's credential, not the one configured for the host it named.
+    assert_eq!(
+        auth_headers.for_url_with_package("https://cdn.example.test/demo", None),
+        Some("Bearer crate-token".to_string()),
+    );
 }
 
 #[tokio::test]
@@ -353,7 +496,8 @@ fn rejects_a_symlinked_cargo_config_parent() {
     fs::write(&external_config, "unchanged\n").unwrap();
     symlink(outside.path(), workspace.path().join(".cargo")).unwrap();
 
-    let error = write_cargo_config(workspace.path()).unwrap_err().to_string();
+    let error =
+        write_cargo_config(workspace.path(), CRATES_IO_SPARSE_INDEX).unwrap_err().to_string();
 
     assert!(error.contains("must be a real directory"), "{error}");
     assert_eq!(fs::read_to_string(external_config).unwrap(), "unchanged\n");
@@ -370,7 +514,7 @@ fn config_write_stays_in_the_directory_pinned_before_a_parent_swap() {
     fs::write(outside.path().join("config.toml"), "unchanged\n").unwrap();
     symlink(outside.path(), workspace.path().join(".cargo")).unwrap();
 
-    write_cargo_config_in(&cargo_dir).unwrap();
+    write_cargo_config_in(&cargo_dir, CRATES_IO_SPARSE_INDEX).unwrap();
 
     assert_eq!(fs::read_to_string(outside.path().join("config.toml")).unwrap(), "unchanged\n");
     assert!(fs::read_to_string(pinned_path.join("config.toml")).unwrap().contains(MANAGED_CONFIG));
@@ -483,6 +627,32 @@ async fn cargo_resolution_is_offloaded_to_the_pnpr_server() {
         .await;
 
     let lockfile = resolve_via_pnpr(&config_for_pnpr(&server.url()), METADATA).await.unwrap();
+
+    assert_eq!(lockfile.as_deref(), Some("version = 4\n"));
+    handshake.assert_async().await;
+    resolve.assert_async().await;
+}
+
+#[tokio::test]
+async fn configured_cargo_registry_is_sent_to_the_pnpr_server() {
+    let mut server = mockito::Server::new_async().await;
+    let handshake =
+        server.mock("GET", "/-/pnpr").with_body(handshake_body(&["cargo"])).create_async().await;
+    let resolve = server
+        .mock("POST", "/-/pnpr/v0/resolve")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "ecosystem": "cargo",
+            "registry": "https://registry.example.test/index/",
+        })))
+        .with_header("content-type", "application/x-ndjson")
+        .with_body("{\"type\":\"done\",\"lockfile\":\"version = 4\\n\"}\n")
+        .create_async()
+        .await;
+    let mut config = config_for_pnpr(&server.url());
+    config.cargo.index_url = "https://registry.example.test/index/".to_string();
+
+    let lockfile =
+        resolve_via_pnpr(&config, r#"{"packages":[],"workspace_members":[]}"#).await.unwrap();
 
     assert_eq!(lockfile.as_deref(), Some("version = 4\n"));
     handshake.assert_async().await;
