@@ -1,4 +1,4 @@
-use super::{latest_version, missing_index_names, resolve_lockfile};
+use super::{latest_version, missing_index_names, resolve_inputs, resolve_lockfile};
 use cargo_lock::Lockfile;
 use std::{collections::BTreeMap, str::FromStr};
 
@@ -301,4 +301,69 @@ fn selects_an_older_candidate_that_provides_a_requested_feature() {
     assert!(lockfile.packages.iter().any(|package| {
         package.name.as_str() == "foo" && package.version == semver::Version::new(1, 0, 0)
     }));
+}
+
+#[test]
+fn resolve_inputs_drops_everything_but_the_dependency_graph() {
+    const FULL_METADATA: &str = r#"{
+      "packages": [{
+        "id": "path+file:///home/dev/secret-workspace#app@0.1.0",
+        "name": "app",
+        "version": "0.1.0",
+        "license": "MIT",
+        "manifest_path": "/home/dev/secret-workspace/Cargo.toml",
+        "targets": [{"name": "app", "src_path": "/home/dev/secret-workspace/src/lib.rs"}],
+        "dependencies": [{
+          "name": "foo",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "req": "^1.0",
+          "path": "/home/dev/secret-workspace/vendor/foo"
+        }]
+      }],
+      "workspace_root": "/home/dev/secret-workspace",
+      "workspace_members": ["path+file:///home/dev/secret-workspace#app@0.1.0"]
+    }"#;
+
+    let reduced = resolve_inputs(FULL_METADATA).unwrap();
+
+    assert!(!reduced.contains("secret-workspace"), "{reduced}");
+    let index_files = BTreeMap::from([
+        ("foo".to_string(), FOO_INDEX.to_string()),
+        ("bar".to_string(), BAR_INDEX.to_string()),
+    ]);
+    assert_eq!(
+        resolve_lockfile(&reduced, &index_files).unwrap(),
+        resolve_lockfile(FULL_METADATA, &index_files).unwrap(),
+    );
+}
+
+#[test]
+fn resolve_inputs_keeps_the_features_a_dependency_requests() {
+    const FEATURE_GATED_FOO_INDEX: &str = r#"{"name":"foo","vers":"1.0.0","deps":[{"name":"bar","req":"^2","features":[],"optional":true,"default_features":true,"target":null,"kind":"normal","registry":null}],"cksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","features":{"bar-support":["dep:bar"]},"yanked":false}"#;
+    const METADATA: &str = r#"{
+      "packages": [{
+        "id": "path+file:///workspace#app@0.1.0",
+        "name": "app",
+        "version": "0.1.0",
+        "dependencies": [{
+          "name": "foo",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "req": "^1.0",
+          "features": ["bar-support"]
+        }]
+      }],
+      "workspace_members": ["path+file:///workspace#app@0.1.0"]
+    }"#;
+
+    let reduced = resolve_inputs(METADATA).unwrap();
+
+    let index_files = BTreeMap::from([
+        ("foo".to_string(), FEATURE_GATED_FOO_INDEX.to_string()),
+        ("bar".to_string(), BAR_INDEX.to_string()),
+    ]);
+    let lockfile = Lockfile::from_str(&resolve_lockfile(&reduced, &index_files).unwrap()).unwrap();
+    assert!(
+        lockfile.packages.iter().any(|package| package.name.as_str() == "bar"),
+        "the feature that activates bar survived the reduction: {lockfile:?}",
+    );
 }

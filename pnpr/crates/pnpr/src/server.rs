@@ -140,7 +140,7 @@ struct HostedOriginalRef {
 /// sharing one hosted store, the same race needs a conditional write
 /// (S3 `If-Match` / `ETag`); that is the cross-replica half tracked in
 /// [pnpm/pnpm#12199](https://github.com/pnpm/pnpm/issues/12199).
-struct StripedLocks {
+pub(crate) struct StripedLocks {
     stripes: Box<[tokio::sync::Mutex<()>]>,
 }
 
@@ -149,13 +149,13 @@ impl StripedLocks {
     /// rare while staying tiny in memory.
     const STRIPES: usize = 64;
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let stripes = (0..Self::STRIPES).map(|_| tokio::sync::Mutex::new(())).collect();
         Self { stripes }
     }
 
     /// Lock the stripe owning `name`, held until the returned guard is dropped.
-    async fn lock(&self, name: &str) -> tokio::sync::MutexGuard<'_, ()> {
+    pub(crate) async fn lock(&self, name: &str) -> tokio::sync::MutexGuard<'_, ()> {
         self.stripes[self.stripe_index(name)].lock().await
     }
 
@@ -2995,10 +2995,16 @@ async fn serve_ping(State(_state): State<AppState>) -> Response {
 /// protocol. A plain npm registry has no such route and 404s, so a
 /// client can fail fast against a misconfigured server. `versions`
 /// lists the `/-/pnpr/vN/resolve` protocol versions this server speaks;
-/// `fixLockfile` narrows that list to versions that honor repair requests.
+/// `fixLockfile` narrows that list to versions that honor repair requests;
+/// `ecosystems` names the package ecosystems `/-/pnpr/v0/resolve` accepts
+/// in its request body, so a client meeting a server that does not serve
+/// one of them resolves it locally rather than failing.
 async fn serve_pnpr_handshake(State(state): State<AppState>) -> Response {
-    let versions = state.inner.config.resolver.enabled.then_some(0).into_iter().collect::<Vec<_>>();
+    let resolver_enabled = state.inner.config.resolver.enabled;
+    let versions = resolver_enabled.then_some(0).into_iter().collect::<Vec<_>>();
     let fix_lockfile = versions.clone();
+    let resolved = if resolver_enabled { crate::resolver::RESOLVED_ECOSYSTEMS } else { &[] };
+    let ecosystems = resolved.iter().map(|ecosystem| ecosystem.as_str()).collect::<Vec<_>>();
     let artifacts =
         state.inner.config.artifacts.enabled.then_some(0).into_iter().collect::<Vec<_>>();
     (
@@ -3008,6 +3014,7 @@ async fn serve_pnpr_handshake(State(state): State<AppState>) -> Response {
                 "versions": versions,
                 "artifacts": artifacts,
                 "fixLockfile": fix_lockfile,
+                "ecosystems": ecosystems,
             }
         })),
     )

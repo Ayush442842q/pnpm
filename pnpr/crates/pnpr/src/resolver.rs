@@ -43,6 +43,7 @@
 //! fail closed.
 
 mod cache;
+mod cargo;
 mod protocol;
 mod request_validation;
 mod resolve;
@@ -59,6 +60,7 @@ use std::{
 use pnpr_config::Config as RegistryConfig;
 use pnpr_osv::OsvIndex;
 use pnpr_policy::Identity;
+use pnpr_registry::Ecosystem;
 use pnpr_route::{Footprint, RouteContext, RouteHook};
 
 use axum::{
@@ -80,7 +82,7 @@ use pnpm_store_dir::StoreDir;
 
 use self::{
     cache::{CachedResolution, cached_resolution, resolution_cache_key, store_resolution},
-    protocol::ResolveRequest,
+    protocol::{EcosystemProbe, ResolveRequest},
     request_validation::{
         reject_inline_url_auth, reject_invalid_patch_hashes, reject_invalid_registries,
         reject_off_allowlist_fetches,
@@ -131,6 +133,13 @@ pub(crate) struct Resolver {
     /// Public URL clients use for pnpr-hosted and `/~<name>/` endpoint
     /// tarball URLs.
     public_url: String,
+    /// How long a cached Cargo sparse-index file stays fresh: the
+    /// server's `packument_ttl`, so index metadata ages out on the same
+    /// schedule npm packuments do.
+    cargo_index_ttl: Duration,
+    /// Serializes the fetch of one Cargo sparse-index file, so concurrent
+    /// resolves of the same cold graph fetch each entry once.
+    cargo_index_locks: Arc<crate::server::StripedLocks>,
     /// HMAC secret namespacing a private footprint's cache descriptor.
     /// Part 1 uses it only to label each resolve's cache class in the
     /// operator debug log; Part 2 keys private cache entries by it.
@@ -174,6 +183,8 @@ impl Resolver {
             osv_index,
             route_context,
             public_url: config.public_url.clone(),
+            cargo_index_ttl: config.packument_ttl,
+            cargo_index_locks: Arc::new(crate::server::StripedLocks::new()),
             resolution_cache_secret: Arc::clone(&config.resolution_cache_secret),
         }
     }
@@ -197,6 +208,14 @@ impl Resolver {
             Arc::clone(&self.resolution_cache_secret),
         ));
         Arc::new(AuthHeaders::from_by_scope(request.auth_headers.clone()).with_route_hook(hook))
+    }
+
+    /// Where `registry`'s Cargo sparse-index files are cached. The origin
+    /// is hashed into the path so two registries serving the same crate
+    /// name never share an entry; the caller's route scope adds the last
+    /// namespace segment at fetch time.
+    fn cargo_index_cache_dir(&self, registry: &str) -> PathBuf {
+        self.cache_dir.join("cargo-index").join(pnpm_crypto_hash::create_hex_hash(registry))
     }
 
     /// Resolve (or build + intern) the `&'static Config` for a request's
@@ -400,9 +419,39 @@ fn intern_config(
     Some(config)
 }
 
-/// Handle `POST /-/pnpr/v0/resolve`: verify the client's input lockfile under
-/// the client's policy, resolve against the client's registries, and
-/// stream the result back as NDJSON.
+/// The ecosystems `/-/pnpr/v0/resolve` resolves, which the handshake
+/// advertises. It has to agree with [`handle_resolve`]'s dispatch below:
+/// an ecosystem named here that the dispatch refuses would send a client to
+/// an endpoint that turns it away.
+pub(crate) const RESOLVED_ECOSYSTEMS: &[Ecosystem] = &[Ecosystem::Npm, Ecosystem::Cargo];
+
+/// Handle `POST /-/pnpr/v0/resolve`. One address serves every ecosystem;
+/// the body's `ecosystem` field selects which resolver reads it, and a
+/// body without one means npm.
+pub(crate) async fn handle_resolve(
+    runtime: &Resolver,
+    identity: Identity,
+    body: Bytes,
+) -> Response {
+    let probe: EcosystemProbe = match serde_json::from_slice(&body) {
+        Ok(probe) => probe,
+        Err(err) => return json_error(StatusCode::BAD_REQUEST, &err.to_string()),
+    };
+    match probe.ecosystem {
+        Ecosystem::Npm => handle_npm_resolve(runtime, identity, &body).await,
+        Ecosystem::Cargo => cargo::handle_resolve(runtime, identity, &body).await,
+        // Listed rather than caught, so an ecosystem added to the shared
+        // enum stops here for a decision instead of being refused silently.
+        ecosystem @ Ecosystem::Pypi => json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("this pnpr server does not resolve {ecosystem} dependencies"),
+        ),
+    }
+}
+
+/// Resolve an npm project: verify the client's input lockfile under the
+/// client's policy, resolve against the client's registries, and stream
+/// the result back as NDJSON.
 ///
 /// The response is `application/x-ndjson`: one `package` frame per
 /// resolved tarball as the server's tree walk yields it (so the client
@@ -414,12 +463,8 @@ fn intern_config(
 /// short-circuit paths (frozen reuse, cache hit) emit only the terminal
 /// `done` frame. A private proxied tarball is announced through its
 /// upstream's `/~<name>/` registry endpoint rather than its upstream URL.
-pub(crate) async fn handle_resolve(
-    runtime: &Resolver,
-    identity: Identity,
-    body: Bytes,
-) -> Response {
-    let request: ResolveRequest = match serde_json::from_slice(&body) {
+async fn handle_npm_resolve(runtime: &Resolver, identity: Identity, body: &[u8]) -> Response {
+    let request: ResolveRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &err.to_string()),
     };
