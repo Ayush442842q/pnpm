@@ -46,7 +46,7 @@ use pnpm_lockfile::TarballRevision;
 use pnpr_auth::{AuthState, UpsertOutcome, identify};
 use pnpr_config::{Config, HostedConfig};
 use pnpr_error::RegistryError;
-use pnpr_package_name::PackageName;
+use pnpr_package_name::CanonicalPackageName;
 use pnpr_policy::Identity;
 use pnpr_registry::{ConcreteKind, Ecosystem, Registry, Resolved};
 use pnpr_storage::{
@@ -592,7 +592,7 @@ async fn serve_registry_version_manifest(
     version_or_tag: &str,
     tarball_base: &str,
 ) -> Response {
-    let name = match PackageName::parse(raw_name) {
+    let name = match CanonicalPackageName::parse(raw_name, pnpr_package_name::Ecosystem::Npm) {
         Ok(n) => n,
         Err(err) => return err.into_response(),
     };
@@ -817,7 +817,7 @@ async fn load_upstream_packument(
     state: &AppState,
     namespace: &str,
     upstream: &Upstream,
-    name: &PackageName,
+    name: &CanonicalPackageName,
     ttl: Duration,
 ) -> Result<Option<Vec<u8>>, RegistryError> {
     if upstream.caches()
@@ -891,7 +891,7 @@ async fn recover_stale_upstream_packument(
     state: &AppState,
     namespace: &str,
     upstream: &Upstream,
-    name: &PackageName,
+    name: &CanonicalPackageName,
     err: RegistryError,
 ) -> Result<Option<Vec<u8>>, RegistryError> {
     if !err.is_transient_upstream_error() || !upstream.caches() {
@@ -918,7 +918,7 @@ async fn load_upstream_packument_for(
     state: &AppState,
     identity: &Identity,
     upstream: &str,
-    name: &PackageName,
+    name: &CanonicalPackageName,
 ) -> Result<Option<Vec<u8>>, RegistryError> {
     let namespace = upstream_cache_namespace(state, upstream);
     let upstream = authorized_upstream(state, identity, upstream)?;
@@ -936,7 +936,7 @@ async fn load_packument_for_read(
     state: &AppState,
     identity: &Identity,
     registry: Option<&str>,
-    name: &PackageName,
+    name: &CanonicalPackageName,
 ) -> Result<Option<Vec<u8>>, RegistryError> {
     let target = match registry {
         Some(registry) => registry.to_string(),
@@ -973,7 +973,7 @@ async fn serve_packument_via_upstream(
     identity: &Identity,
     headers: &HeaderMap,
     upstream: &str,
-    name: &PackageName,
+    name: &CanonicalPackageName,
     tarball_base: &str,
     revision_registry: Option<&str>,
 ) -> Response {
@@ -1008,7 +1008,7 @@ async fn serve_tarball_via_upstream(
     raw_name: &str,
     filename: &str,
 ) -> Response {
-    let name = match PackageName::parse(raw_name) {
+    let name = match CanonicalPackageName::parse(raw_name, pnpr_package_name::Ecosystem::Npm) {
         Ok(n) => n,
         Err(err) => return err.into_response(),
     };
@@ -1250,7 +1250,10 @@ async fn serve_hosted_revision_tarball(
             Err(err) => return private_no_cache(err.into_response()),
         };
         for original in refs {
-            let package = match PackageName::parse(&original.package) {
+            let package = match CanonicalPackageName::parse(
+                &original.package,
+                pnpr_package_name::Ecosystem::Npm,
+            ) {
                 Ok(package) => package,
                 Err(err) => return private_no_cache(err.into_response()),
             };
@@ -1334,7 +1337,7 @@ async fn hosted_revision_refs(
 
 async fn hosted_original_is_current(
     storage: &Storage,
-    package: &PackageName,
+    package: &CanonicalPackageName,
     version: &str,
     digest: &str,
 ) -> Result<bool, RegistryError> {
@@ -1353,7 +1356,7 @@ async fn hosted_original_is_current(
 
 async fn open_hosted_revision_tarball(
     storage: &Storage,
-    package: &PackageName,
+    package: &CanonicalPackageName,
     version: &str,
     digest: &str,
     integrity: &Integrity,
@@ -1440,7 +1443,7 @@ fn original_integrity(dist: &HostedRevisionDist) -> Option<Integrity> {
 async fn cached_upstream_tarball(
     state: &AppState,
     namespace: &str,
-    name: &PackageName,
+    name: &CanonicalPackageName,
     filename: &str,
 ) -> Option<Response> {
     match timed(
@@ -1640,7 +1643,7 @@ async fn serve_registry_packument(
     raw_name: &str,
     tarball_base: &str,
 ) -> Response {
-    let name = match PackageName::parse(raw_name) {
+    let name = match CanonicalPackageName::parse(raw_name, pnpr_package_name::Ecosystem::Npm) {
         Ok(n) => n,
         Err(err) => return err.into_response(),
     };
@@ -1693,7 +1696,7 @@ async fn serve_registry_tarball(
     raw_name: &str,
     filename: &str,
 ) -> Response {
-    let name = match PackageName::parse(raw_name) {
+    let name = match CanonicalPackageName::parse(raw_name, pnpr_package_name::Ecosystem::Npm) {
         Ok(n) => n,
         Err(err) => return err.into_response(),
     };
@@ -1788,7 +1791,7 @@ async fn serve_hosted_packument(
     identity: &Identity,
     headers: &HeaderMap,
     source: &str,
-    name: &PackageName,
+    name: &CanonicalPackageName,
     tarball_base: &str,
 ) -> Response {
     let org = match hosted_read_namespace(state, identity, source, name.as_str()) {
@@ -1818,7 +1821,7 @@ async fn serve_hosted_tarball(
     state: &AppState,
     identity: &Identity,
     source: &str,
-    name: &PackageName,
+    name: &CanonicalPackageName,
     filename: &str,
 ) -> Response {
     let org = match hosted_read_namespace(state, identity, source, name.as_str()) {
@@ -1894,7 +1897,7 @@ struct DistBlock {
 
 fn expected_tarball_dist(
     packument: &[u8],
-    name: &PackageName,
+    name: &CanonicalPackageName,
     filename: &str,
 ) -> Result<Option<TarballDist>, RegistryError> {
     let packument: PackumentDists = serde_json::from_slice(packument)?;
@@ -1953,7 +1956,7 @@ fn expected_tarball_dist(
 
 fn tarball_stream_error(
     err: streaming::BlobStreamError,
-    name: &PackageName,
+    name: &CanonicalPackageName,
     filename: &str,
 ) -> RegistryError {
     tarball_stream_error_for_package(err, name.as_str(), filename)
@@ -2474,7 +2477,9 @@ async fn serve_org_packages(
     raw_scope: &str,
 ) -> Response {
     let scope = raw_scope.strip_prefix('@').unwrap_or(raw_scope);
-    if PackageName::parse(&format!("@{scope}/package")).is_err() {
+    if CanonicalPackageName::parse(&format!("@{scope}/package"), pnpr_package_name::Ecosystem::Npm)
+        .is_err()
+    {
         return not_found();
     }
     let Some(registry) = registry.map(str::to_string).or_else(|| default_registry_target(state))
@@ -2681,7 +2686,7 @@ fn resolve_write_target(
     state: &AppState,
     identity: &Identity,
     registry: Option<&str>,
-    name: &PackageName,
+    name: &CanonicalPackageName,
 ) -> Result<WriteTarget, RegistryError> {
     resolve_write_target_for(state, identity, registry, Ecosystem::Npm, name)
 }
@@ -2692,7 +2697,7 @@ fn resolve_write_target_for(
     identity: &Identity,
     registry: Option<&str>,
     ecosystem: Ecosystem,
-    name: &PackageName,
+    name: &CanonicalPackageName,
 ) -> Result<WriteTarget, RegistryError> {
     match resolve_publish_target_for(state, identity, registry, ecosystem, name.as_str()) {
         PublishTarget::Hosted { source, org } => Ok(WriteTarget { source, org }),
@@ -2728,7 +2733,7 @@ fn wants_abbreviated(headers: &HeaderMap) -> bool {
 /// `application/vnd.npm.install-v1+json` content type. Parse
 /// failures surface as 502 via `RegistryError::Json`.
 fn packument_response(
-    name: &PackageName,
+    name: &CanonicalPackageName,
     bytes: &[u8],
     tarball_base: &str,
     revision_registry: Option<&str>,
@@ -2755,7 +2760,7 @@ fn packument_response(
 
 fn filter_osv_vulnerable_versions(
     packument: &mut Value,
-    name: &PackageName,
+    name: &CanonicalPackageName,
     osv_index: Option<&Arc<pnpr_osv::OsvIndex>>,
 ) {
     let Some(osv_index) = osv_index else { return };
@@ -2801,7 +2806,7 @@ fn filter_osv_vulnerable_versions(
 fn filter_osv_vulnerable_dist_tags(
     tags: &mut Value,
     packument: &Value,
-    name: &PackageName,
+    name: &CanonicalPackageName,
     osv_index: Option<&Arc<pnpr_osv::OsvIndex>>,
 ) {
     let Some(osv_index) = osv_index else { return };
@@ -2845,7 +2850,7 @@ fn resolve_version_or_tag<'a>(packument: &'a Value, version_or_tag: &'a str) -> 
 
 fn ensure_osv_allowed(
     state: &AppState,
-    name: &PackageName,
+    name: &CanonicalPackageName,
     version: &str,
 ) -> Result<(), RegistryError> {
     let Some(osv_index) = state.inner.osv_index.as_ref() else {
