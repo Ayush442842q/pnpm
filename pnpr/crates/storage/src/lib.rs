@@ -171,7 +171,10 @@ impl HostedRevisionRefIndex {
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_TEMP_CREATE_ATTEMPTS: usize = 16;
 pub const PACKUMENT_WRITE_RETRIES: usize = 8;
-pub(crate) const RECOVERY_PACKUMENT_WRITE_RETRIES: usize = 32;
+/// Retries the commit path allows the document write: higher than the
+/// request-path budget because a sealed transaction has to converge, and a
+/// startup recovery may be racing every other replica's recovery at once.
+pub(crate) const COMMIT_DOCUMENT_WRITE_RETRIES: usize = 32;
 const PACKUMENT_WRITE_CONFLICT_DELAY_MS: u64 = 5;
 const MAX_PACKUMENT_WRITE_CONFLICT_DELAY_MS: u64 = 250;
 
@@ -353,8 +356,9 @@ pub enum PackumentWrite {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackumentUpdate {
     Written,
-    /// The `build` closure reported that the packument does not exist
-    /// (returned `Ok(None)`), so there was nothing to update.
+    /// `build` returned `Ok(None)`, so nothing was written: the packument
+    /// the caller wanted to change does not exist, or the change it computed
+    /// turned out to be no change at all.
     NotFound,
 }
 
