@@ -19,6 +19,15 @@ use command_extra::CommandExtra;
 use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
 use std::{fs, path::Path};
 
+fn assert_no_import_backups(lockfile_dir: &Path) {
+    let leftovers: Vec<_> = fs::read_dir(lockfile_dir)
+        .expect("read the lockfile directory")
+        .map(|entry| entry.expect("read a lockfile directory entry").file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".import.bak"))
+        .collect();
+    assert!(leftovers.is_empty(), "import backups left behind: {leftovers:?}");
+}
+
 const DEP_OF_PKG_WITH_1_DEP: &str = "@pnpm.e2e/dep-of-pkg-with-1-dep";
 
 /// The manifest shared by pnpm's `has-package-lock-json`,
@@ -489,6 +498,229 @@ fn import_replaces_existing_lockfile() {
     );
 
     drop((root, npmrc_info));
+}
+
+#[test]
+fn import_preserves_project_lockfile_with_external_lockfile_dir() {
+    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    npmrc_info.set_dist_tag(DEP_OF_PKG_WITH_1_DEP, "100.1.0", "latest");
+
+    write_file(&workspace, "package.json", NPM_FIXTURE_MANIFEST);
+    write_file(&workspace, "package-lock.json", NPM_LOCKFILE_V1);
+    append_workspace_yaml_key(&workspace, "lockfileDir", "..");
+    let project_lockfile = "# project lockfile must stay unchanged\n";
+    write_file(&workspace, "pnpm-lock.yaml", project_lockfile);
+
+    pacquet.with_arg("import").assert().success();
+
+    assert_pins(
+        root.path(),
+        &["@pnpm.e2e/dep-of-pkg-with-1-dep@100.0.0"],
+        &["@pnpm.e2e/dep-of-pkg-with-1-dep@100.1.0"],
+    );
+    let lockfile = pnpm_lockfile::Lockfile::load_wanted_from_dir(root.path())
+        .expect("load imported lockfile")
+        .expect("imported lockfile exists");
+    assert_eq!(lockfile.importers.into_keys().collect::<Vec<_>>(), ["workspace"]);
+    assert_eq!(
+        fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read project lockfile"),
+        project_lockfile,
+    );
+    assert!(!workspace.join("node_modules").exists(), "import must not create node_modules");
+
+    drop((root, npmrc_info));
+}
+
+#[test]
+fn import_replaces_external_lockfile_and_preserves_its_env_document() {
+    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    npmrc_info.set_dist_tag(DEP_OF_PKG_WITH_1_DEP, "100.1.0", "latest");
+
+    write_file(&workspace, "package.json", NPM_FIXTURE_MANIFEST);
+    write_file(&workspace, "package-lock.json", NPM_LOCKFILE_V1);
+    write_file(root.path(), "pnpm-lock.yaml", "# stale placeholder lockfile\n");
+    let mut env_lockfile = pnpm_lockfile::EnvLockfile::create();
+    env_lockfile.root_importer_mut().config_dependencies.insert(
+        "@pnpm.e2e/foo".to_string(),
+        pnpm_lockfile::SpecifierAndResolution {
+            specifier: "1.0.0".to_string(),
+            version: "1.0.0".to_string(),
+        },
+    );
+    env_lockfile.write(root.path()).expect("write external env document");
+    append_workspace_yaml_key(&workspace, "lockfileDir", "..");
+
+    pacquet.with_arg("import").assert().success();
+
+    let lockfile = pnpm_lockfile::Lockfile::load_wanted_from_dir(root.path())
+        .expect("load imported lockfile")
+        .expect("imported lockfile exists");
+    let packages: Vec<_> = lockfile
+        .packages
+        .expect("imported packages exist")
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        packages.contains(&"@pnpm.e2e/dep-of-pkg-with-1-dep@100.0.0".to_string()),
+        "imported packages: {packages:?}",
+    );
+    assert!(
+        !packages.contains(&"@pnpm.e2e/dep-of-pkg-with-1-dep@100.1.0".to_string()),
+        "imported packages: {packages:?}",
+    );
+    assert_eq!(
+        pnpm_lockfile::EnvLockfile::read(root.path()).expect("read external env document"),
+        Some(env_lockfile),
+    );
+    assert!(!workspace.join("pnpm-lock.yaml").exists(), "no lockfile in the project directory");
+    assert_no_import_backups(root.path());
+
+    drop((root, npmrc_info));
+}
+
+#[test]
+fn import_preserves_shared_lockfile_when_writing_a_branch_lockfile() {
+    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    npmrc_info.set_dist_tag(DEP_OF_PKG_WITH_1_DEP, "100.1.0", "latest");
+
+    write_file(&workspace, "package.json", NPM_FIXTURE_MANIFEST);
+    write_file(&workspace, "package-lock.json", NPM_LOCKFILE_V1);
+    write_file(&workspace, ".git/HEAD", "ref: refs/heads/feature/import\n");
+    append_workspace_yaml_key(&workspace, "lockfileDir", "..");
+    append_workspace_yaml_key(&workspace, "gitBranchLockfile", true);
+    let shared_lockfile = "# shared lockfile must stay unchanged\n";
+    write_file(root.path(), "pnpm-lock.yaml", shared_lockfile);
+    let mut env_lockfile = pnpm_lockfile::EnvLockfile::create();
+    env_lockfile.root_importer_mut().config_dependencies.insert(
+        "@pnpm.e2e/foo".to_string(),
+        pnpm_lockfile::SpecifierAndResolution {
+            specifier: "1.0.0".to_string(),
+            version: "1.0.0".to_string(),
+        },
+    );
+    env_lockfile.write(root.path()).expect("write shared env document");
+    let shared_lockfile =
+        fs::read_to_string(root.path().join("pnpm-lock.yaml")).expect("read shared lockfile");
+    write_file(root.path(), "pnpm-lock.feature!import.yaml", "# stale branch lockfile\n");
+
+    pacquet.with_arg("import").assert().success();
+
+    let lockfile =
+        pnpm_lockfile::Lockfile::load_from_path(&root.path().join("pnpm-lock.feature!import.yaml"))
+            .expect("load branch lockfile")
+            .expect("branch lockfile exists");
+    assert_eq!(lockfile.importers.into_keys().collect::<Vec<_>>(), ["workspace"]);
+    let packages = lockfile.packages.expect("imported packages exist");
+    assert!(
+        packages.keys().any(|key| key.to_string() == "@pnpm.e2e/dep-of-pkg-with-1-dep@100.0.0"),
+    );
+    assert!(
+        !packages.keys().any(|key| key.to_string() == "@pnpm.e2e/dep-of-pkg-with-1-dep@100.1.0"),
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("pnpm-lock.yaml")).expect("read shared lockfile"),
+        shared_lockfile,
+    );
+    assert_no_import_backups(root.path());
+
+    drop((root, npmrc_info));
+}
+
+#[test]
+fn failed_import_restores_branch_lockfile() {
+    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_file(
+        &workspace,
+        "package.json",
+        r#"{"dependencies":{"@pnpm.e2e/hello-world-js-bin-parent":"99.99.99"}}"#,
+    );
+    write_file(&workspace, "package-lock.json", NPM_LOCKFILE_V1);
+    write_file(&workspace, ".git/HEAD", "ref: refs/heads/feature/import\n");
+    append_workspace_yaml_key(&workspace, "lockfileDir", "..");
+    append_workspace_yaml_key(&workspace, "gitBranchLockfile", true);
+    let shared_lockfile = "# shared lockfile\n";
+    let branch_lockfile = "# branch lockfile\n";
+    write_file(root.path(), "pnpm-lock.yaml", shared_lockfile);
+    write_file(root.path(), "pnpm-lock.feature!import.yaml", branch_lockfile);
+
+    let output = pacquet.with_arg("import").assert().failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("ERR_PNPM_NO_MATCHING_VERSION"), "stderr:\n{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.path().join("pnpm-lock.feature!import.yaml"))
+            .expect("read restored branch lockfile"),
+        branch_lockfile,
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("pnpm-lock.yaml")).expect("read shared lockfile"),
+        shared_lockfile,
+    );
+    assert_no_import_backups(root.path());
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn failed_import_restores_external_lockfile() {
+    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_file(
+        &workspace,
+        "package.json",
+        r#"{"dependencies":{"@pnpm.e2e/hello-world-js-bin-parent":"99.99.99"}}"#,
+    );
+    write_file(&workspace, "package-lock.json", NPM_LOCKFILE_V1);
+    append_workspace_yaml_key(&workspace, "lockfileDir", "..");
+    let original_lockfile = "# existing external lockfile\n";
+    write_file(root.path(), "pnpm-lock.yaml", original_lockfile);
+
+    let output = pacquet.with_arg("import").assert().failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("ERR_PNPM_NO_MATCHING_VERSION"), "stderr:\n{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.path().join("pnpm-lock.yaml")).expect("read restored lockfile"),
+        original_lockfile,
+    );
+    assert_no_import_backups(root.path());
+    assert!(!workspace.join("pnpm-lock.yaml").exists(), "no lockfile in the project directory");
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn failed_import_writes_no_lockfile_where_there_was_none() {
+    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_file(
+        &workspace,
+        "package.json",
+        r#"{"dependencies":{"@pnpm.e2e/hello-world-js-bin-parent":"99.99.99"}}"#,
+    );
+    write_file(&workspace, "package-lock.json", NPM_LOCKFILE_V1);
+    append_workspace_yaml_key(&workspace, "lockfileDir", "..");
+
+    let output = pacquet.with_arg("import").assert().failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("ERR_PNPM_NO_MATCHING_VERSION"), "stderr:\n{stderr}");
+    assert!(
+        !root.path().join("pnpm-lock.yaml").exists(),
+        "no lockfile in the external lockfile directory",
+    );
+    assert_no_import_backups(root.path());
+    assert!(!workspace.join("pnpm-lock.yaml").exists(), "no lockfile in the project directory");
+
+    drop((root, mock_instance));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use crate::State;
 use clap::Args;
 use miette::{Context, IntoDiagnostic};
-use pnpm_lockfile::EnvLockfile;
+use pnpm_lockfile::{EnvLockfile, Lockfile};
 use pnpm_lockfile_import::{read_foreign_lockfile_versions, to_preferred_versions};
 use pnpm_network::redact_url_for_display;
 use pnpm_package_manager::{Install, ProjectMutation};
@@ -24,10 +24,15 @@ impl ImportArgs {
         let State { tarball_mem_cache, http_client, config, manifest, resolved_packages, .. } =
             &state;
         let dir = manifest.path().parent().expect("manifest path always has a parent dir");
-        let lockfile_path = dir.join("pnpm-lock.yaml");
-        let env_lockfile = EnvLockfile::read(dir)
-            .into_diagnostic()
-            .wrap_err("reading the env lockfile before import")?;
+        let lockfile_dir = state.lockfile_dir();
+        let lockfile_path = state.lockfile_path();
+        let env_lockfile = if config.wanted_lockfile_name() == Lockfile::FILE_NAME {
+            EnvLockfile::read(lockfile_dir)
+                .into_diagnostic()
+                .wrap_err("reading the env lockfile before import")?
+        } else {
+            None
+        };
 
         if let Some(pnpr_server) = self.pnpr_server.as_deref().or(config.pnpr_server.as_deref()) {
             let pnpr_server = redact_url_for_display(pnpr_server);
@@ -38,7 +43,10 @@ impl ImportArgs {
 
         let preferred_versions = to_preferred_versions(&read_foreign_lockfile_versions(dir)?);
 
-        let lockfile_backup = lockfile_path.with_extension("yaml.import.bak");
+        // A backup of its own keeps overlapping imports from restoring each
+        // other's copy.
+        let lockfile_backup =
+            lockfile_path.with_extension(format!("yaml.{}.import.bak", std::process::id()));
         let lockfile_existed = lockfile_path.exists();
         if lockfile_existed {
             std::fs::rename(&lockfile_path, &lockfile_backup)
@@ -94,7 +102,7 @@ impl ImportArgs {
         let import_result = install_result.and_then(|()| {
             if let Some(env_lockfile) = env_lockfile {
                 env_lockfile
-                    .write(dir)
+                    .write(lockfile_dir)
                     .into_diagnostic()
                     .wrap_err("preserving the env lockfile after import")?;
             }
@@ -111,27 +119,35 @@ impl ImportArgs {
                 Ok(())
             }
             Err(error) => {
-                if lockfile_existed {
-                    restore_lockfile(&lockfile_path, &lockfile_backup).wrap_err_with(|| {
-                        format!("restoring pnpm-lock.yaml after import failed: {error}")
-                    })?;
-                }
+                discard_failed_import(
+                    &lockfile_path,
+                    lockfile_existed.then_some(lockfile_backup.as_path()),
+                )
+                .wrap_err_with(|| {
+                    format!(
+                        "restoring {} after the failed import: {error}",
+                        lockfile_path.display(),
+                    )
+                })?;
                 Err(error)
             }
         }
     }
 }
 
-fn restore_lockfile(
+/// Restores the destination an import replaced. An import that started
+/// without a lockfile there leaves none behind.
+fn discard_failed_import(
     lockfile_path: &std::path::Path,
-    backup_path: &std::path::Path,
+    backup_path: Option<&std::path::Path>,
 ) -> miette::Result<()> {
     if let Err(error) = std::fs::remove_file(lockfile_path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
         return Err(error).into_diagnostic().wrap_err("removing the failed imported lockfile");
     }
+    let Some(backup_path) = backup_path else { return Ok(()) };
     std::fs::rename(backup_path, lockfile_path)
         .into_diagnostic()
-        .wrap_err("restoring the original pnpm-lock.yaml")
+        .wrap_err("restoring the original lockfile")
 }
