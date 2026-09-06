@@ -253,6 +253,13 @@ export async function handler (
       'If you don\'t want to see this warning anymore, you may set the ignore-workspace-root-check setting to true.'
     )
   }
+  const allowBuildSelectors = opts.allowBuild?.map(parseAllowBuildSelector) ?? []
+  if (
+    allowBuildSelectors.length &&
+    (opts.argv.original.includes('--allow-build') || allowBuildSelectors.some(({ name }) => name === ''))
+  ) {
+    throw new PnpmError('ALLOW_BUILD_MISSING_PACKAGE', 'The --allow-build flag is missing a package name. Please specify the package name(s) that are allowed to run installation scripts.')
+  }
   if (opts.global) {
     if (!opts.bin) {
       throw new PnpmError('NO_GLOBAL_BIN_DIR', 'Unable to find the global bin directory', {
@@ -264,6 +271,7 @@ export async function handler (
     }
     return handleGlobalAdd({
       ...opts,
+      allowBuilds: applyAllowBuildSelectors(opts.allowBuilds, allowBuildSelectors),
       ...createGlobalPolicyCallbacks(opts),
     }, params, commands ?? {})
   }
@@ -273,11 +281,7 @@ export async function handler (
     devDependencies: opts.dev !== false,
     optionalDependencies: opts.optional !== false,
   }
-  if (opts.allowBuild?.length) {
-    const allowBuildSelectors = opts.allowBuild.map(parseAllowBuildSelector)
-    if (opts.argv.original.includes('--allow-build') || allowBuildSelectors.some(({ name }) => name === '')) {
-      throw new PnpmError('ALLOW_BUILD_MISSING_PACKAGE', 'The --allow-build flag is missing a package name. Please specify the package name(s) that are allowed to run installation scripts.')
-    }
+  if (allowBuildSelectors.length) {
     if (opts.allowBuilds) {
       const disallowedBuilds = Object.entries(opts.allowBuilds)
         .filter(([, value]) => value === false)
@@ -290,10 +294,7 @@ export async function handler (
         })
       }
     }
-    const allowBuilds = { ...opts.allowBuilds }
-    for (const { name, allowed } of allowBuildSelectors) {
-      allowBuilds[name] = allowed
-    }
+    const allowBuilds = applyAllowBuildSelectors(opts.allowBuilds, allowBuildSelectors)
     if (opts.rootProjectManifestDir) {
       opts.rootProjectManifest = opts.rootProjectManifest ?? {}
       await writeSettings({
@@ -323,4 +324,15 @@ export async function handler (
     includeDirect: include,
     dryRun: false,
   }, params)
+}
+
+function applyAllowBuildSelectors (
+  allowBuilds: Record<string, boolean | string> | undefined,
+  selectors: Array<ReturnType<typeof parseAllowBuildSelector>>
+): Record<string, boolean | string> {
+  const updated = { ...allowBuilds }
+  for (const { name, allowed } of selectors) {
+    updated[name] = allowed
+  }
+  return updated
 }
