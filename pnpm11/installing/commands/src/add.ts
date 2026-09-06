@@ -1,3 +1,4 @@
+import { parseAllowBuildSelector } from '@pnpm/building.policy'
 import type { CommandHandlerMap } from '@pnpm/cli.command'
 import { FILTERING, OPTIONS, UNIVERSAL_OPTIONS } from '@pnpm/cli.common-cli-options-help'
 import { docsUrl } from '@pnpm/cli.utils'
@@ -183,7 +184,7 @@ For options that may be used with `-r`, see "pnpm help recursive"',
           OPTIONS.globalDir,
           ...UNIVERSAL_OPTIONS,
           {
-            description: 'A list of package names that are allowed to run postinstall scripts during installation',
+            description: 'A list of package names that are allowed to run postinstall scripts during installation. Prefix a name with ! to deny its scripts instead',
             name: '--allow-build',
           },
         ],
@@ -273,14 +274,15 @@ export async function handler (
     optionalDependencies: opts.optional !== false,
   }
   if (opts.allowBuild?.length) {
-    if (opts.argv.original.includes('--allow-build')) {
+    const allowBuildSelectors = opts.allowBuild.map(parseAllowBuildSelector)
+    if (opts.argv.original.includes('--allow-build') || allowBuildSelectors.some(({ name }) => name === '')) {
       throw new PnpmError('ALLOW_BUILD_MISSING_PACKAGE', 'The --allow-build flag is missing a package name. Please specify the package name(s) that are allowed to run installation scripts.')
     }
     if (opts.allowBuilds) {
       const disallowedBuilds = Object.entries(opts.allowBuilds)
         .filter(([, value]) => value === false)
         .map(([pkg]) => pkg)
-      const allowedOnly = opts.allowBuild.filter((pkg) => !pkg.startsWith('!'))
+      const allowedOnly = allowBuildSelectors.filter(({ allowed }) => allowed).map(({ name }) => name)
       const overlapDependencies = disallowedBuilds.filter((dep) => allowedOnly.includes(dep))
       if (overlapDependencies.length) {
         throw new PnpmError('OVERRIDING_IGNORED_BUILT_DEPENDENCIES', `The following dependencies are ignored by the root project, but are allowed to be built by the current command: ${overlapDependencies.join(', ')}`, {
@@ -289,10 +291,8 @@ export async function handler (
       }
     }
     const allowBuilds = { ...opts.allowBuilds }
-    for (const pkg of opts.allowBuild) {
-      const isNegated = pkg.startsWith('!')
-      const name = isNegated ? pkg.slice(1) : pkg
-      allowBuilds[name] = !isNegated
+    for (const { name, allowed } of allowBuildSelectors) {
+      allowBuilds[name] = allowed
     }
     if (opts.rootProjectManifestDir) {
       opts.rootProjectManifest = opts.rootProjectManifest ?? {}

@@ -980,12 +980,12 @@ pub async fn approve_global_builds<Reporter: self::Reporter + 'static>(
         }
         groups.push((package.install_dir, scan));
     }
-    if pending.is_empty() {
+    if pending.is_empty() && args.packages.is_empty() {
         println!("There are no packages awaiting approval");
         return Ok(());
     }
     let pending = pending.into_iter().collect::<Vec<_>>();
-    let Some(decision) = args.decide(&pending)? else {
+    let Some(decision) = args.decide::<Reporter>(&pending)? else {
         return Ok(());
     };
 
@@ -1060,7 +1060,7 @@ async fn prompt_approve_global_builds<Reporter: self::Reporter + 'static>(
 
     let args = ApproveBuildsArgs { packages: Vec::new(), all: auto_approve, global: false };
     if let Some((rebuild_state, build_packages)) =
-        args.prepare(global_pkg_dir, &config_fn, &state_fn)?
+        args.prepare::<Reporter>(global_pkg_dir, &config_fn, &state_fn)?
     {
         let selection = crate::cli_args::rebuild::RebuildSelection {
             names: Some(build_packages),

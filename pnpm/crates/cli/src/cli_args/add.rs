@@ -18,7 +18,7 @@ use clap::Args;
 use derive_more::{Display, Error};
 use miette::{Context, Diagnostic, IntoDiagnostic};
 use pnpm_config::Config;
-use pnpm_package_manager::Add;
+use pnpm_package_manager::{Add, parse_allow_build_selector};
 use pnpm_package_manifest::DependencyGroup;
 use pnpm_registry::RangeSpecStyle;
 use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
@@ -203,7 +203,8 @@ pub struct AddArgs {
     #[clap(long = "config")]
     pub config: bool,
     /// Package names allowed to run lifecycle (build) scripts during this
-    /// install, appended to `allowBuilds`. May be repeated.
+    /// install, appended to `allowBuilds`. Prefix a name with `!` to deny
+    /// its scripts instead. May be repeated.
     #[clap(long = "allow-build")]
     pub allow_build: Vec<String>,
     /// Dependencies are not downloaded. Only `pnpm-lock.yaml` is updated.
@@ -525,11 +526,13 @@ pub(crate) fn apply_allow_build(
     let mut allow_build_map: Vec<(&str, bool)> = Vec::with_capacity(allow_build.len());
     let mut allowed_only: Vec<&str> = Vec::new();
     for pkg in allow_build {
-        if let Some(stripped) = pkg.strip_prefix('!') {
-            allow_build_map.push((stripped, false));
-        } else {
-            allow_build_map.push((pkg.as_str(), true));
-            allowed_only.push(pkg.as_str());
+        let (name, allowed) = parse_allow_build_selector(pkg);
+        if name.is_empty() {
+            return Err(AllowBuildError::MissingPackage.into());
+        }
+        allow_build_map.push((name, allowed));
+        if allowed {
+            allowed_only.push(name);
         }
     }
     let overlap: Vec<&str> = allowed_only
@@ -586,6 +589,12 @@ pub enum AllowBuildError {
         )
     )]
     OverridingIgnoredBuiltDependencies { dependencies: String },
+
+    #[display(
+        "The --allow-build flag is missing a package name. Please specify the package name(s) that are allowed to run installation scripts."
+    )]
+    #[diagnostic(code(ERR_PNPM_ALLOW_BUILD_MISSING_PACKAGE))]
+    MissingPackage,
 }
 
 /// Add a single package to `state`'s manifest and install it.

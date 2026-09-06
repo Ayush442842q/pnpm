@@ -118,6 +118,16 @@ export function packageNameFromAllowBuildKey (key: string): string | undefined {
   return name
 }
 
+/**
+ * The package an `--allow-build` value or an `approve-builds` argument names,
+ * and whether it is allowed to build: a leading `!` denies the build.
+ */
+export function parseAllowBuildSelector (selector: string): { name: string, allowed: boolean } {
+  return selector.startsWith('!')
+    ? { name: selector.slice(1), allowed: false }
+    : { name: selector, allowed: true }
+}
+
 function addAllowBuildRule (
   pkg: string,
   target: {

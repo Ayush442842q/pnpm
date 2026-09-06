@@ -10,6 +10,7 @@ pub(crate) mod slots;
 
 pub use allow_build_policy::{
     AllowBuildPolicy, allow_build_key_from_ignored_build, normalize_build_dep_path,
+    parse_allow_build_selector,
 };
 pub(crate) use build_one_snapshot::build_one_snapshot;
 pub use slots::parse_name_version_from_key;

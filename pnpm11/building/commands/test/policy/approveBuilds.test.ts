@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { expect, jest, test } from '@jest/globals'
+import { beforeEach, expect, jest, test } from '@jest/globals'
 import type { ApproveBuildsCommandOpts, RebuildCommandOpts } from '@pnpm/building.commands'
 import { getConfig } from '@pnpm/config.reader'
 import { readModulesManifest } from '@pnpm/installing.modules-yaml'
@@ -31,11 +31,23 @@ jest.unstable_mockModule('@inquirer/prompts', () => {
     select: jest.fn(),
   }
 })
+const actualLogger = await import('@pnpm/logger')
+jest.unstable_mockModule('@pnpm/logger', () => ({
+  ...actualLogger,
+  globalWarn: jest.fn(),
+}))
+
 const { checkbox, confirm } = await import('@inquirer/prompts')
+const { globalWarn } = await import('@pnpm/logger')
 const { approveBuilds } = await import('@pnpm/building.commands')
 
 const mockCheckbox = jest.mocked(checkbox)
 const mockConfirm = jest.mocked(confirm)
+const mockGlobalWarn = jest.mocked(globalWarn)
+
+beforeEach(() => {
+  mockGlobalWarn.mockClear()
+})
 
 const REGISTRY = `http://localhost:${REGISTRY_MOCK_PORT}/`
 const pnpmBin = path.join(import.meta.dirname, '../../../../pnpm/bin/pnpm.mjs')
@@ -335,6 +347,7 @@ test('positional arguments with unknown package updates allowBuilds setting with
 
   await approveBuilds.handler(config, ['@pnpm.e2e/nonexistent-package'], {})
 
+  expect(mockGlobalWarn).toHaveBeenCalledWith('The following packages are not awaiting approval: @pnpm.e2e/nonexistent-package')
   const workspaceManifest = readYamlFileSync<any>(path.resolve('pnpm-workspace.yaml')) // eslint-disable-line
   expect(workspaceManifest.allowBuilds).toStrictEqual({
     '@pnpm.e2e/nonexistent-package': true,
@@ -353,10 +366,48 @@ test('!pkg with unknown package preemptively denies build without error', async 
 
   await approveBuilds.handler(config, ['!@pnpm.e2e/nonexistent-package'], {})
 
+  expect(mockGlobalWarn).toHaveBeenCalledWith('The following packages are not awaiting approval: @pnpm.e2e/nonexistent-package')
   const workspaceManifest = readYamlFileSync<any>(path.resolve('pnpm-workspace.yaml')) // eslint-disable-line
   expect(workspaceManifest.allowBuilds).toStrictEqual({
     '@pnpm.e2e/nonexistent-package': false,
   })
+})
+
+test('!pkg is recorded preemptively when no builds are awaiting approval', async () => {
+  prepare({})
+
+  await execPnpmInstall()
+  const config = await getApproveBuildsConfig()
+
+  await approveBuilds.handler(config, ['!@pnpm.e2e/pre-and-postinstall-scripts-example'], {})
+
+  expect(mockGlobalWarn).toHaveBeenCalledWith('The following packages are not awaiting approval: @pnpm.e2e/pre-and-postinstall-scripts-example')
+  const workspaceManifest = readYamlFileSync<any>(path.resolve('pnpm-workspace.yaml')) // eslint-disable-line
+  expect(workspaceManifest.allowBuilds).toStrictEqual({
+    '@pnpm.e2e/pre-and-postinstall-scripts-example': false,
+  })
+})
+
+test('no arguments and no pending builds writes nothing', async () => {
+  prepare({})
+
+  await execPnpmInstall()
+  const config = await getApproveBuildsConfig()
+
+  await approveBuilds.handler(config, [], {})
+
+  expect(fs.existsSync(path.resolve('pnpm-workspace.yaml'))).toBe(false)
+})
+
+test('an argument that names no package throws an error', async () => {
+  prepare({})
+
+  await execPnpmInstall()
+  const config = await getApproveBuildsConfig()
+
+  await expect(
+    approveBuilds.handler(config, ['!'], {})
+  ).rejects.toThrow('A package name is missing from the arguments')
 })
 
 test('contradictory arguments throw error', async () => {

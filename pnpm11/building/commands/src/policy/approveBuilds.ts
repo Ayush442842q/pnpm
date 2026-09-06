@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 
 import { checkbox, confirm } from '@inquirer/prompts'
-import { allowBuildKeyFromIgnoredBuild } from '@pnpm/building.policy'
+import { allowBuildKeyFromIgnoredBuild, parseAllowBuildSelector } from '@pnpm/building.policy'
 import type { CommandHandlerMap } from '@pnpm/cli.command'
 import type { Config, ConfigContext } from '@pnpm/config.reader'
 import { writeSettings } from '@pnpm/config.writer'
@@ -83,6 +83,12 @@ export async function handler (opts: ApproveBuildsCommandOpts & RebuildCommandOp
       'Cannot use --all with positional arguments'
     )
   }
+  if (params.some((param) => parseAllowBuildSelector(param).name === '')) {
+    throw new PnpmError(
+      'APPROVE_BUILDS_MISSING_PACKAGE',
+      'A package name is missing from the arguments. Please specify the package name(s) to approve (`<pkg>`) or deny (`!<pkg>`).'
+    )
+  }
   const targets = await getApprovalTargets(opts)
   const automaticallyIgnoredBuilds = sortUniqueStrings(targets.flatMap((target) => target.automaticallyIgnoredBuilds ?? []))
   if (!automaticallyIgnoredBuilds.length && !params.length) {
@@ -93,14 +99,14 @@ export async function handler (opts: ApproveBuildsCommandOpts & RebuildCommandOp
   const approved: string[] = []
   const unknown: string[] = []
   for (const p of params) {
-    const name = p.startsWith('!') ? p.slice(1) : p
+    const { name, allowed } = parseAllowBuildSelector(p)
     if (!automaticallyIgnoredBuilds.includes(name)) {
       unknown.push(name)
     }
-    if (p.startsWith('!')) {
-      denied.push(name)
-    } else {
+    if (allowed) {
       approved.push(name)
+    } else {
+      denied.push(name)
     }
   }
   if (unknown.length) {

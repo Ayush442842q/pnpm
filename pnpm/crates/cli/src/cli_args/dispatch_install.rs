@@ -776,8 +776,14 @@ pub(super) fn approve_builds<'a>(
     // The settings/prompt work is synchronous; only the rebuild is async, so
     // the non-`Send` `config` / `state` closures stay out of the awaited
     // future.
-    let Some((rebuild_state, build_packages)) = args.prepare(ctx.dir, ctx.config, ctx.state)?
-    else {
+    let prepared = match ctx.reporter {
+        ReporterType::Default | ReporterType::AppendOnly => {
+            args.prepare::<DefaultReporter>(ctx.dir, ctx.config, ctx.state)
+        }
+        ReporterType::Ndjson => args.prepare::<NdjsonReporter>(ctx.dir, ctx.config, ctx.state),
+        ReporterType::Silent => args.prepare::<SilentReporter>(ctx.dir, ctx.config, ctx.state),
+    };
+    let Some((rebuild_state, build_packages)) = prepared? else {
         return Ok(Box::pin(std::future::ready(Ok(()))));
     };
     let selected =

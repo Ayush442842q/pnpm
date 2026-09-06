@@ -370,6 +370,44 @@ fn add_accepts_dir_allow_build_and_registry_after_the_subcommand() {
     drop((root, mock_instance));
 }
 
+/// `--allow-build=!<pkg>` denies the build instead of recording a literal
+/// `!<pkg>` key that matches nothing.
+#[test]
+fn add_denies_a_build_with_the_negation_prefix() {
+    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let registry = mock_instance.url();
+
+    pacquet
+        .with_args([
+            "add",
+            "@pnpm.e2e/pre-and-postinstall-scripts-example@1.0.0",
+            "--allow-build=!@pnpm.e2e/pre-and-postinstall-scripts-example",
+        ])
+        .with_arg(format!("--registry={registry}"))
+        .assert()
+        .success();
+
+    let pkg_dir = workspace.join(
+        "node_modules/.pnpm/@pnpm.e2e+pre-and-postinstall-scripts-example@1.0.0\
+         /node_modules/@pnpm.e2e/pre-and-postinstall-scripts-example",
+    );
+    assert!(
+        !pkg_dir.join("generated-by-postinstall.js").exists(),
+        "a denied package must not run its postinstall",
+    );
+
+    let yaml = std::fs::read_to_string(workspace.join("pnpm-workspace.yaml"))
+        .expect("pnpm-workspace.yaml present");
+    assert!(
+        yaml.contains("'@pnpm.e2e/pre-and-postinstall-scripts-example': false"),
+        "the denial should be persisted, got:\n{yaml}",
+    );
+
+    drop((root, mock_instance));
+}
+
 #[test]
 fn should_install_all_dependencies() {
     let (root, workspace, anchor) =
