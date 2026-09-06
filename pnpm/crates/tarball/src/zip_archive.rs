@@ -249,11 +249,12 @@ pub(crate) fn write_zip_entry_to_cas(
 
 /// Run one full zip-archive fetch attempt: hit the network, drain the
 /// body into RAM, verify the integrity hash, then walk the zip and
-/// extract every file entry into the CAFS. Mirrors
-/// [`crate::download::fetch_and_extract_once`] one-for-one (same network permit
-/// shape, same post-download semaphore gate, same retry-friendly
-/// errors) — only the `spawn_blocking` body differs: integrity check
-/// then [`extract_zip_entries`] instead of the gzip + tar path.
+/// extract every file entry into the CAFS.
+///
+/// Keep this in step with [`crate::download::fetch_and_extract_once`]:
+/// the two share a network permit shape, a post-download semaphore
+/// gate, and a retry classification, and a change to one that is not
+/// mirrored in the other silently splits the two archive formats.
 ///
 /// Writes directly into the CAS via [`StoreDir::write_cas_file`]
 /// rather than extracting to a temp dir and importing each file.
@@ -305,7 +306,7 @@ pub(crate) async fn fetch_and_extract_zip_once<Reporter: self::Reporter>(
     };
     drop(client);
 
-    let _post_download_permit = post_download_semaphore()
+    let post_download_permit = post_download_semaphore()
         .acquire()
         .await
         .expect("post-download semaphore shouldn't be closed this soon");
@@ -315,7 +316,8 @@ pub(crate) async fn fetch_and_extract_zip_once<Reporter: self::Reporter>(
     let package_integrity = package_integrity.clone();
     let package_url_owned = package_url.to_string();
     let archive_prefix_owned: Option<String> = archive_prefix.map(str::to_string);
-    let result = tokio::task::spawn_blocking(
+    let result = crate::extraction_task::spawn_extraction(
+        post_download_permit,
         move || -> Result<(HashMap<String, PathBuf>, PackageFilesIndex), TarballError> {
             crate::download::verify_tarball_integrity(
                 &buffer,
