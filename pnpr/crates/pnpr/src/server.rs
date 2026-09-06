@@ -1,6 +1,7 @@
 mod authentication;
 mod batch;
 mod cargo;
+mod compiler_cache;
 mod documents;
 mod ecosystem;
 mod package_mutation;
@@ -105,6 +106,7 @@ struct AppState {
 struct AppInner {
     storage: Storage,
     artifacts: Option<pnpr_shared_artifacts::SharedArtifactStore>,
+    compiler_cache_uploads: tokio::sync::Semaphore,
     /// One [`Upstream`] per declared upstream, keyed by the same name
     /// used in [`Config::upstreams`]. Built once at router construction
     /// time so each request avoids re-allocating a `ThrottledClient`.
