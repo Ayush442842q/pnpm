@@ -203,6 +203,8 @@ registries:
     type: router
     sources: [local, npmjs]
 
+  # See ../pnpr/README.md for Cargo and Python registry examples.
+
 # The path-less base URL (`https://<pnpr>/`) aliases this registry.
 defaultRegistry: main
 

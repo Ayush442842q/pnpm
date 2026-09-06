@@ -37,7 +37,7 @@ use std::{
     num::NonZeroUsize,
     ops::Deref,
     sync::{Arc, LazyLock, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -255,12 +255,103 @@ fn origin_of(url: &str) -> Option<String> {
 /// still draining, and the per-process FD count overruns the
 /// platform limit — surfacing as `EMFILE` "too many open files".
 pub struct ThrottledClientGuard<'a> {
-    _permit: Permit,
+    permit: Permit,
     /// The per-origin `maxSockets` permit, held for the same request lifetime
-    /// as `_permit`. `None` when no `maxSockets` cap is configured or the URL
+    /// as `permit`. `None` when no `maxSockets` cap is configured or the URL
     /// had no parseable origin.
-    _host_permit: Option<OwnedSemaphorePermit>,
+    host_permit: Option<OwnedSemaphorePermit>,
     client: &'a Client,
+}
+
+/// A response that retains the global and per-origin permits through body reads.
+pub struct ThrottledResponse {
+    response: reqwest::Response,
+    _permit: Permit,
+    _host_permit: Option<OwnedSemaphorePermit>,
+    body_timeout: Duration,
+    received_at: Instant,
+}
+
+impl ThrottledClientGuard<'_> {
+    /// Transfer both concurrency permits to the response body owner.
+    #[must_use]
+    pub fn retain_for_body(
+        self,
+        response: reqwest::Response,
+        body_timeout: Duration,
+    ) -> ThrottledResponse {
+        ThrottledResponse {
+            response,
+            _permit: self.permit,
+            _host_permit: self.host_permit,
+            body_timeout,
+            received_at: Instant::now(),
+        }
+    }
+}
+
+impl ThrottledResponse {
+    pub async fn bytes(self) -> Result<bytes::Bytes, reqwest::Error> {
+        let Self { response, _permit, _host_permit, .. } = self;
+        response.bytes().await
+    }
+
+    /// Buffer at most one channel chunk. The producer deadline and cancellation
+    /// remain active even while the consumer stops polling the stream.
+    pub fn bytes_stream(
+        mut self,
+    ) -> impl futures_util::Stream<Item = std::io::Result<bytes::Bytes>> + Send {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (completion_sender, completion) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let remaining = self.body_timeout.saturating_sub(self.received_at.elapsed());
+            let result = tokio::select! {
+                () = sender.closed() => Ok(()),
+                result = tokio::time::timeout(remaining, async {
+                    while let Some(chunk) = self.response.chunk().await.map_err(std::io::Error::other)? {
+                        if sender.send(chunk).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Ok(())
+                }) => result.unwrap_or_else(|_| Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "upstream response body deadline exceeded",
+                ))),
+            };
+            drop(self);
+            let _ = completion_sender.send(result);
+        });
+        futures_util::stream::try_unfold(
+            (receiver, completion),
+            |(mut receiver, completion)| async move {
+                if let Some(chunk) = receiver.recv().await {
+                    return Ok(Some((chunk, (receiver, completion))));
+                }
+                completion.await.map_err(std::io::Error::other)??;
+                Ok::<_, std::io::Error>(None)
+            },
+        )
+    }
+}
+
+impl Deref for ThrottledResponse {
+    type Target = reqwest::Response;
+
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+
+impl std::fmt::Debug for ThrottledResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ThrottledResponse")
+            .field("response", &self.response)
+            .field("body_timeout", &self.body_timeout)
+            .field("received_at", &self.received_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Deref for ThrottledClientGuard<'_> {
@@ -301,8 +392,8 @@ impl ThrottledClient {
     pub async fn acquire(&self) -> ThrottledClientGuard<'_> {
         let permit = self.semaphore.acquire(UNPRIORITIZED).await;
         ThrottledClientGuard {
-            _permit: permit,
-            _host_permit: None,
+            permit,
+            host_permit: None,
             client: &self.default_clients.follow_redirects,
         }
     }
@@ -685,18 +776,37 @@ impl ThrottledClient {
         accept: Option<&str>,
         body_limit: usize,
     ) -> Result<SecureAuthResponse, reqwest::Error> {
+        let (response, _guard) = self
+            .get_response_with_scoped_headers(url, |mut request, url| {
+                if let Some(accept) = accept {
+                    request = request.header(reqwest::header::ACCEPT, accept);
+                }
+                if let Some(authorization) = auth_headers.for_secure_url(url) {
+                    request = request.header("authorization", authorization);
+                }
+                request
+            })
+            .await?;
+        let status = response.status();
+        let url = response.url().to_string();
+        let body = read_limited_body(response, body_limit).await?;
+        Ok(SecureAuthResponse { status, body: body.bytes, body_truncated: body.truncated, url })
+    }
+
+    /// Follow a GET's redirects, rebuilding its headers for each destination.
+    /// The returned guard retains the request budget while the caller reads
+    /// the response body. Configured redirect guards apply at every hop.
+    pub async fn get_response_with_scoped_headers(
+        &self,
+        url: &str,
+        configure: impl Fn(reqwest::RequestBuilder, &str) -> reqwest::RequestBuilder,
+    ) -> Result<(reqwest::Response, ThrottledClientGuard<'_>), reqwest::Error> {
         let mut current_url = url.to_string();
         for redirect_count in 0..=MAX_REDIRECT_HOPS {
             let client = self
                 .acquire_for_url_without_redirects_with_priority(&current_url, UNPRIORITIZED)
                 .await;
-            let mut request = client.get(&current_url);
-            if let Some(accept) = accept {
-                request = request.header(reqwest::header::ACCEPT, accept);
-            }
-            if let Some(authorization) = auth_headers.for_secure_url(&current_url) {
-                request = request.header("authorization", authorization);
-            }
+            let request = configure(client.get(&current_url), &current_url);
             let response = request.send().await?;
             let target = response
                 .headers()
@@ -710,14 +820,7 @@ impl ThrottledClient {
                 current_url = target.to_string();
                 continue;
             }
-            let status = response.status();
-            let body = read_limited_body(response, body_limit).await?;
-            return Ok(SecureAuthResponse {
-                status,
-                body: body.bytes,
-                body_truncated: body.truncated,
-                url: current_url,
-            });
+            return Ok((response, client));
         }
         unreachable!()
     }
@@ -739,7 +842,7 @@ impl ThrottledClient {
         let permit = self.semaphore.acquire(priority).await;
         let clients = self.per_registry.pick_value_for_url(url).unwrap_or(&self.default_clients);
         let client = clients.select(follow_redirects);
-        ThrottledClientGuard { _permit: permit, _host_permit: host_permit, client }
+        ThrottledClientGuard { permit, host_permit, client }
     }
 }
 
