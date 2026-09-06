@@ -40,8 +40,9 @@
 //! - [`encode_pkg_name`] — mixed-case package names get a sha256 hex
 //!   suffix so case-insensitive filesystems (HFS+, NTFS by default)
 //!   can't collide two distinct package names onto one mirror file.
-//! - [`get_registry_name`] — `host[:port]` with `:` → `+` (a
-//!   filesystem-safe encoding).
+//! - [`get_registry_name`] — a registry URL's host, port and path as
+//!   one filesystem-safe directory name, and [`decode_registry_name`]
+//!   to read it back.
 
 use std::{
     collections::HashMap,
@@ -57,7 +58,8 @@ use std::{
 
 use derive_more::{Display, Error};
 use miette::Diagnostic;
-use pnpm_network::MetadataCacheScope;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use pnpm_network::{MetadataCacheScope, redact_and_sanitize, redact_url_for_display};
 use pnpm_registry::{DerivedPackuments, MirrorFile, Package, PackageVersions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -176,54 +178,128 @@ pub fn get_pkg_mirror_path(
 
 /// Failure parsing a registry URL into a filesystem-safe slug.
 /// Real-world registries always carry a host; this only triggers on
-/// malformed config.
+/// malformed config. `url` is redacted for display — a registry can
+/// carry `user:pass@` credentials that must not reach a CI log.
 #[derive(Debug, Display, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum EncodeRegistryError {
     #[display("Failed to parse registry URL {url:?}: {error}")]
-    #[diagnostic(code(ERR_PNPM_RESOLVING_NPM_RESOLVER_MIRROR_PARSE_REGISTRY))]
+    #[diagnostic(code(ERR_PNPM_INVALID_REGISTRY_URL))]
     ParseUrl {
         #[error(not(source))]
         url: String,
         error: String,
     },
     #[display("Registry URL {url:?} has no host")]
-    #[diagnostic(code(ERR_PNPM_RESOLVING_NPM_RESOLVER_MIRROR_MISSING_HOST))]
+    #[diagnostic(code(ERR_PNPM_MISSING_REGISTRY_HOST))]
     MissingHost {
         #[error(not(source))]
         url: String,
     },
 }
 
-/// `host[:port]` form of a registry URL with `:` rewritten to `+` so
-/// the result is filesystem-safe. Only an explicit port participates;
-/// the implicit-default port stays out of the slug so a registry served
-/// on its scheme default hashes consistently across configs.
+/// Everything a registry key does not carry verbatim. Escaping all of
+/// it means a `+`, `_` or `%` in the key is always one
+/// [`get_registry_name`] wrote, and the key can never contain a path
+/// separator, a character Windows rejects in a filename, or a glob
+/// metacharacter — the cache commands interpolate the key straight into
+/// a glob pattern, and `pnpm cache delete` erases whatever that pattern
+/// matches.
+const ESCAPED_IN_REGISTRY_KEY: &AsciiSet = &NON_ALPHANUMERIC.remove(b'.').remove(b'-');
+
+/// The 255-byte limit on one filename that ext4, APFS and NTFS share. A
+/// registry path long enough to exceed it would make every mirror read
+/// miss and every mirror write fail, so such a key collapses to its own
+/// hash: still one directory per registry, just no longer readable.
+const MAX_KEY_LENGTH: usize = 255;
+
+/// Directory name under the metadata cache root that holds a registry's
+/// mirrored packuments, shaped `<host>[+<port>][_<path>][_<hash>]`.
+///
+/// `+` joins the port to the host and the path segments to one another,
+/// `_` separates the host from the path, and every other occurrence of
+/// those characters is escaped — so no two registry URLs share a
+/// directory. They must not: a shared directory lets the resolver answer
+/// from another registry's versions, integrity hashes and tarball URLs,
+/// which surfaces as `ERR_PNPM_TARBALL_URL_MISMATCH` when the lockfile is
+/// verified.
+///
+/// The port is dropped when it is the scheme's default and leading and
+/// trailing slashes are trimmed, so the same registry spelled
+/// `https://r/`, `https://r:443` and `https://r:443/` keeps one cache
+/// rather than three. A path that is not all lowercase gets a sha256
+/// suffix, the guard [`encode_pkg_name`] applies to package names,
+/// because HFS+ and NTFS would otherwise merge `…/Team` into `…/team`. A
+/// key that would not fit a 255-byte filename is replaced by its own hash.
 pub fn get_registry_name(registry: &str) -> Result<String, EncodeRegistryError> {
     let parsed = reqwest::Url::parse(registry).map_err(|error| EncodeRegistryError::ParseUrl {
-        url: registry.to_string(),
+        url: redact_and_sanitize(registry),
         error: error.to_string(),
     })?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| EncodeRegistryError::MissingHost { url: registry.to_string() })?;
-    let host_with_port = match parsed.port() {
-        Some(port) => format!("{host}+{port}"),
-        None => host.to_string(),
-    };
-    let base = host_with_port.replace(':', "+");
+    let host = parsed.host_str().ok_or_else(|| EncodeRegistryError::MissingHost {
+        url: redact_url_for_display(registry),
+    })?;
+    let mut key = escape_registry_key_component(host);
+    if let Some(port) = parsed.port() {
+        write!(key, "+{port}").expect("writing to a String never fails");
+    }
     let path = parsed.path().trim_matches('/');
     if path.is_empty() {
-        Ok(base)
-    } else {
-        let encoded_path = path
-            .replace('%', "%25")
-            .replace('_', "%5F")
-            .replace('+', "%2B")
-            .replace(':', "%3A")
-            .replace('/', "+");
-        Ok(format!("{base}_{encoded_path}"))
+        return Ok(key);
     }
+    key.push('_');
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            key.push('+');
+        }
+        key.push_str(&escape_registry_key_component(segment));
+    }
+    if path.to_lowercase() != path {
+        let digest = Sha256::digest(path.as_bytes());
+        write!(key, "_{digest:x}").expect("writing to a String never fails");
+    }
+    if key.len() > MAX_KEY_LENGTH {
+        let digest = Sha256::digest(key.as_bytes());
+        key = format!("{digest:x}");
+    }
+    Ok(key)
+}
+
+/// The registry a key made by [`get_registry_name`] came from, minus its
+/// scheme: `host[:port][/path]`. The sha256 that separates two paths
+/// differing only in case is not part of the registry, so it is dropped.
+///
+/// `pnpm cache view` labels its output with this, and the cache root may
+/// also hold directories written by another pnpm version, so an
+/// unrecognized name is returned unchanged instead of erroring.
+#[must_use]
+pub fn decode_registry_name(registry_key: &str) -> String {
+    let mut parts = registry_key.split('_');
+    let host = parts.next().unwrap_or_default();
+    let Some(host) = decode_registry_key_component(host, ":") else {
+        return registry_key.to_string();
+    };
+    match parts.next() {
+        None => host,
+        Some(path) => match decode_registry_key_component(path, "/") {
+            Some(path) => format!("{host}/{path}"),
+            None => registry_key.to_string(),
+        },
+    }
+}
+
+/// `None` when the component does not percent-decode to UTF-8, which
+/// leaves the caller the same choice `decodeRegistry` makes in pnpm v11:
+/// hand back the key untouched rather than a lossy rendering of it.
+fn decode_registry_key_component(component: &str, delimiter: &str) -> Option<String> {
+    percent_decode_str(&component.replace('+', delimiter))
+        .decode_utf8()
+        .ok()
+        .map(std::borrow::Cow::into_owned)
+}
+
+fn escape_registry_key_component(component: &str) -> String {
+    utf8_percent_encode(component, ESCAPED_IN_REGISTRY_KEY).to_string()
 }
 
 /// Filesystem-safe form of a package name. A mixed-case name gets a
