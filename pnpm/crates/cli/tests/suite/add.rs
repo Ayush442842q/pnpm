@@ -370,8 +370,8 @@ fn add_accepts_dir_allow_build_and_registry_after_the_subcommand() {
     drop((root, mock_instance));
 }
 
-/// `--allow-build=!<pkg>` denies the build instead of recording a literal
-/// `!<pkg>` key that matches nothing.
+/// `--allow-build=!<pkg>` denies the package's build: `allowBuilds` records
+/// `<pkg>: false` and the install script does not run.
 #[test]
 fn add_denies_a_build_with_the_negation_prefix() {
     let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =

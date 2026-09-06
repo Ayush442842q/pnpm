@@ -121,6 +121,9 @@ export function packageNameFromAllowBuildKey (key: string): string | undefined {
 /**
  * The package an `--allow-build` value or an `approve-builds` argument names,
  * and whether it is allowed to build: a leading `!` denies the build.
+ *
+ * A selector that is empty or only `!` yields an empty name. Callers reject
+ * that rather than persist an empty `allowBuilds` key.
  */
 export function parseAllowBuildSelector (selector: string): { name: string, allowed: boolean } {
   return selector.startsWith('!')
