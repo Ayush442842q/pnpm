@@ -47,13 +47,16 @@ search term when a query reaches that limit.
 
 ## Cargo and Python registries
 
-pnpr serves npm, Cargo, and Python registries from one instance. Every
-ecosystem has its own URL prefix: `/<ecosystem>/~<name>/` addresses a
+pnpr serves npm, Cargo, and Python registries from one instance. When more
+than one ecosystem is configured, `/<ecosystem>/~<name>/` addresses a
 registry and `/<ecosystem>/` the default registry, with `npm`, `cargo`, and
-`pypi` as the codes. The original npm addresses, the path-less base and
-`/~<name>/`, keep working as aliases of `/npm/`; under them the first
-segments `npm`, `cargo`, and `pypi` are reserved for the prefixes, so the npm
-packages of those names are reached as `/npm/npm` and so on.
+`pypi` as the codes. When only one ecosystem is configured, its prefix is
+omitted and clients use the host root or `/~<name>/`.
+
+The endpoints that belong to no single ecosystem stay at the root: `/-/ping`,
+the `/-/pnpr/v0/` protocols (resolve, verify-lockfile, shared artifacts, and
+the cross-ecosystem publish transaction), and the account endpoints that mint
+and manage tokens.
 
 A hosted or upstream registry declares the ecosystem it serves (`ecosystem:`,
 npm by default). A router may list sources of every ecosystem: a request only

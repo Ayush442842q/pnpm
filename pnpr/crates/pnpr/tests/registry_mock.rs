@@ -242,14 +242,11 @@ async fn static_mode_returns_404_for_unknown_tarball() {
 }
 
 #[tokio::test]
-async fn serves_the_npm_surface_under_its_ecosystem_prefix() {
+async fn serves_a_single_npm_ecosystem_at_the_root() {
     let storage = common::build_storage();
     let app = router(static_config(storage.path().to_path_buf()));
 
-    // `/npm/...` is the default target, `/npm/~<name>/...` a named registry;
-    // both are the same surface as the original path-less and `/~<name>/`
-    // addresses.
-    for path in ["/npm/@foo/no-deps", "/npm/~main/@foo/no-deps", "/npm/~local/@foo/no-deps"] {
+    for path in ["/@foo/no-deps", "/~main/@foo/no-deps", "/~local/@foo/no-deps"] {
         let response =
             app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{path}");
@@ -258,7 +255,7 @@ async fn serves_the_npm_surface_under_its_ecosystem_prefix() {
     }
     let response = app
         .clone()
-        .oneshot(Request::get("/npm/@foo/no-deps/-/no-deps-1.0.0.tgz").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/@foo/no-deps/-/no-deps-1.0.0.tgz").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -266,10 +263,7 @@ async fn serves_the_npm_surface_under_its_ecosystem_prefix() {
         body_bytes(response.into_body()).await,
         std::fs::read(storage.path().join("@foo/no-deps/no-deps-1.0.0.tgz")).unwrap(),
     );
-    // The account endpoints ride along under the alias.
-    let response = app
-        .oneshot(Request::get("/npm/~main/-/whoami").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
+    let response =
+        app.oneshot(Request::get("/~main/-/whoami").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }

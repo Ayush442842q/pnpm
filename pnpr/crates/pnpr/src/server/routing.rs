@@ -182,21 +182,23 @@ pub(super) fn router_with_auth_and_osv(
         let npm = npm_registry_routes();
         router = router
             // One publish transaction for packages of any ecosystem. It
-            // answers here rather than beside the npm batch endpoint, which
-            // is part of the npm surface and served under `/npm/` with it.
-            .route("/-/pnpr/v0/publish", put(batch::serve_ecosystem_publish))
-            // The npm surface keeps its original addresses (the path-less base
-            // and `/~<name>/`) and gains the ecosystem-scoped alias every
-            // surface has: `/npm/...` and `/npm/~<name>/...`. The account
-            // endpoints ride along under the alias so a client can log in
-            // against `/npm/~<name>/`. Under the original addresses the first
-            // segments `npm`, `cargo`, and `pypi` are reserved for the
-            // ecosystem prefixes, so the npm packages of those names are
-            // reached through the alias (`/npm/npm`).
-            .merge(npm.clone())
-            .nest("/npm", account.merge(npm))
-            .merge(cargo::routes())
-            .merge(pypi::routes());
+            // answers here rather than inside the npm surface.
+            .route("/-/pnpr/v0/publish", put(batch::serve_ecosystem_publish));
+        if state.inner.config.registries.is_only_ecosystem(Ecosystem::Npm) {
+            router = router.merge(npm);
+        } else {
+            router = router.nest("/npm", account.merge(npm));
+        }
+        if state.inner.config.registries.has_ecosystem(Ecosystem::Cargo) {
+            router = router.merge(cargo::routes(
+                !state.inner.config.registries.is_only_ecosystem(Ecosystem::Cargo),
+            ));
+        }
+        if state.inner.config.registries.has_ecosystem(Ecosystem::Pypi) {
+            router = router.merge(pypi::routes(
+                !state.inner.config.registries.is_only_ecosystem(Ecosystem::Pypi),
+            ));
+        }
     }
     let mut router = router
         .layer(DefaultBodyLimit::max(MAX_PUBLISH_BODY_BYTES))

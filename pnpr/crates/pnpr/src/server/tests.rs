@@ -446,7 +446,7 @@ fn access_log_uri_redacts_the_logout_token_segment() {
     );
     // Everything else is logged verbatim, query string included.
     assert_eq!(redact("/foo/-/foo-1.0.0.tgz"), "/foo/-/foo-1.0.0.tgz");
-    assert_eq!(redact("/-/v1/search?text=foo"), "/-/v1/search?text=foo");
+    assert_eq!(redact("/-/npm/v1/search?text=foo"), "/-/npm/v1/search?text=foo");
 }
 
 // --------------------------------------------------------------------

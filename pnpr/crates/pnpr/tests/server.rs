@@ -5065,3 +5065,38 @@ async fn url_delimiters_in_a_package_name_are_rejected() {
     }
     bare.assert_async().await;
 }
+
+#[tokio::test]
+async fn a_single_npm_ecosystem_answers_at_the_root() {
+    let mut upstream = mockito::Server::new_async().await;
+    let bytes = b"npm-tarball-bytes";
+    let _packument = mock_packument_for_tarball(&mut upstream, "npm", "10.0.0", bytes).await;
+    let tarball = upstream
+        .mock("GET", "/npm/-/npm-10.0.0.tgz")
+        .with_status(200)
+        .with_body(bytes)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let app = router(config_for(&upstream.url(), tmp.path().to_path_buf()));
+
+    let doc = app.clone().oneshot(Request::get("/npm").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(doc.status(), StatusCode::OK);
+    let doc = body_json(doc.into_body()).await;
+    let advertised = doc["versions"]["10.0.0"]["dist"]["tarball"].as_str().unwrap().to_string();
+    assert_eq!(advertised, "http://example.test/npm/-/npm-10.0.0.tgz");
+
+    let fetched = app
+        .oneshot(
+            Request::get(advertised.trim_start_matches("http://example.test"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(body_bytes(fetched.into_body()).await, bytes);
+    tarball.assert_async().await;
+}
