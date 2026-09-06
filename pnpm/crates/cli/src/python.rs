@@ -1,5 +1,4 @@
 mod host;
-mod lockfile;
 pub(crate) mod manifest;
 mod registry;
 mod resolver;
@@ -7,8 +6,9 @@ mod resolver;
 use crate::ecosystem_install::{EcosystemManifest, EcosystemWorkspaceInventory, InstallContext};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use host::Interpreter;
-use lockfile::{Inputs, Lockfile};
 use miette::{IntoDiagnostic, Result, WrapErr, bail};
+use pnpm_pnpr_client::{PYPI_ECOSYSTEM, PnprClient, PypiResolveOptions};
+use pnpm_python_resolver::{Inputs, Lockfile};
 use pnpm_reporter::Reporter;
 use pnpm_store_dir::{StoreIndex, StoreIndexWriter};
 use registry::Registry;
@@ -81,7 +81,7 @@ fn save_added(
     let mut lock: Lockfile = toml::from_str(&project.lock).into_diagnostic()?;
     let mut requirements = Vec::new();
     for requirement in options.requirements {
-        let mut requirement = manifest::parse_requirement(requirement)?;
+        let mut requirement = pnpm_python_resolver::parse_requirement(requirement)?;
         if (options.exact || requirement.version_or_url.is_none())
             && let Some(package) =
                 lock.packages.iter().find(|package| package.name == requirement.name)
@@ -152,7 +152,7 @@ async fn prepare<Reporter: self::Reporter + 'static>(
             format!("Basic {}", STANDARD.encode(format!("{username}:{password}"))),
         );
     }
-    registry::validate_url(&index)?;
+    pnpm_python_resolver::validate_url(&index)?;
     if !index.path().ends_with('/') {
         index.set_path(&format!("{}/", index.path()));
     }
@@ -166,16 +166,16 @@ async fn prepare<Reporter: self::Reporter + 'static>(
             if let Some(specifiers) = &project.requires_python {
                 let specifiers: pep440_rs::VersionSpecifiers =
                     specifiers.parse().into_diagnostic()?;
-                if !specifiers.contains(interpreter.environment.python_full_version()) {
+                if !specifiers.contains(interpreter.target.environment.python_full_version()) {
                     bail!(
                         "{} requires Python {specifiers}, but {} was selected",
                         root.display(),
-                        interpreter.environment.python_full_version(),
+                        interpreter.target.environment.python_full_version(),
                     );
                 }
             }
             let requirements = manifest.requirements(config, manifest::DependencySelection::ALL)?;
-            let inputs = Inputs::new(&requirements, &interpreter, index.as_str());
+            let inputs = Inputs::new(&requirements, &interpreter.target, index.as_str());
             let mut registry = Registry {
                 config,
                 client: &context.http_client,
@@ -185,7 +185,7 @@ async fn prepare<Reporter: self::Reporter + 'static>(
                 store_index: store_index.clone(),
                 writer: Arc::clone(&writer),
                 verified: Arc::default(),
-                candidates: BTreeMap::new(),
+                packages: pnpm_python_resolver::Packages::new(),
                 wheels: BTreeMap::new(),
             };
             let lock_path = root.join("pylock.toml");
@@ -206,13 +206,33 @@ async fn prepare<Reporter: self::Reporter + 'static>(
             }
             let lock = if fresh && !resolve {
                 let lock = existing.expect("fresh lockfile exists");
-                lock.seed(&mut registry)?;
+                lock.seed(&mut registry.packages)?;
+                registry.fetch_wheels::<Reporter>(&lock.packages).await?;
+                resolver::validate_locked(&registry, &requirements)?;
+                lock
+            } else if let Some(lock) = resolve_via_pnpr(
+                config,
+                &requirements,
+                &interpreter.target,
+                index.as_str(),
+                project.requires_python.clone(),
+            )
+            .await?
+            {
+                accept_server_lockfile(&lock, &inputs, project.requires_python.as_deref())?;
+                lock.seed(&mut registry.packages)?;
                 registry.fetch_wheels::<Reporter>(&lock.packages).await?;
                 resolver::validate_locked(&registry, &requirements)?;
                 lock
             } else {
                 let solution = resolver::resolve::<Reporter>(&mut registry, &requirements).await?;
-                Lockfile::new(&registry, solution, inputs, project.requires_python.clone())?
+                Lockfile::new(
+                    &registry.packages,
+                    &interpreter.target,
+                    solution,
+                    inputs,
+                    project.requires_python.clone(),
+                )?
             };
             let environment = if context.lockfile_only {
                 None
@@ -224,8 +244,8 @@ async fn prepare<Reporter: self::Reporter + 'static>(
                     .prefix("env-")
                     .tempdir_in(&generations)
                     .into_diagnostic()?;
-                registry.candidates.clear();
-                lock.seed(&mut registry)?;
+                registry.packages.candidates.clear();
+                lock.seed(&mut registry.packages)?;
                 let selected = resolver::locked_solution(
                     &registry,
                     &manifest.requirements(config, selection)?,
@@ -298,6 +318,57 @@ impl pnpm_install_coordinator::PreparedInstall for Prepared {
         }
     }
 }
+/// Refuse a lockfile that answers a different question than this install
+/// asked. Writing one would leave behind a lockfile the next install reads
+/// back as stale, and a frozen install would fail on it outright.
+fn accept_server_lockfile(
+    lock: &Lockfile,
+    inputs: &Inputs,
+    requires_python: Option<&str>,
+) -> Result<()> {
+    if lock.tool.pnpm != *inputs || lock.requires_python.as_deref() != requires_python {
+        bail!("the pnpr server resolved Python dependencies for other inputs");
+    }
+    Ok(())
+}
+
+/// Resolve through the configured pnpr server, which reads the index and
+/// each wheel's metadata instead of making this client download wheels to
+/// find out what they require.
+///
+/// `None` when there is no server to ask, or when the one configured
+/// resolves Python not at all.
+async fn resolve_via_pnpr(
+    config: &pnpm_config::Config,
+    requirements: &[pep508_rs::Requirement],
+    target: &pnpm_python_resolver::Target,
+    index: &str,
+    requires_python: Option<String>,
+) -> Result<Option<Lockfile>> {
+    let Some(pnpr_server) = config.pnpr_server.as_deref().filter(|_| !config.offline) else {
+        return Ok(None);
+    };
+    let client = PnprClient::new(pnpr_server);
+    if !crate::pnpr_ecosystems::server_resolves(&client, pnpr_server, PYPI_ECOSYSTEM)
+        .await
+        .wrap_err("negotiate Python resolution with the pnpr server")?
+    {
+        return Ok(None);
+    }
+    client
+        .resolve_pypi(PypiResolveOptions {
+            requirements: requirements.iter().map(ToString::to_string).collect(),
+            target: target.clone(),
+            index: index.to_string(),
+            requires_python,
+            authorization: config.auth_headers.for_url(pnpr_server),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("resolve Python dependencies through the pnpr server")
+        .map(Some)
+}
+
 fn ensure_environment_parent(root: &Path) -> Result<()> {
     let mut path = root.to_path_buf();
     for component in [".pnpm", "python-envs"] {
@@ -383,3 +454,6 @@ pub(crate) fn execution_paths<'a>(
     paths.extend(config.extra_bin_paths.iter().cloned());
     std::borrow::Cow::Owned(paths)
 }
+
+#[cfg(test)]
+mod tests;

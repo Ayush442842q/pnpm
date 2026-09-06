@@ -4474,6 +4474,7 @@ dependencies = [
  "pnpm-patching",
  "pnpm-pnpr-client",
  "pnpm-publish",
+ "pnpm-python-resolver",
  "pnpm-registry",
  "pnpm-reporter",
  "pnpm-resolving-default-resolver",
@@ -5534,6 +5535,7 @@ dependencies = [
  "pnpm-lockfile",
  "pnpm-lockfile-verification",
  "pnpm-network",
+ "pnpm-python-resolver",
  "pnpm-shared-artifact-protocol",
  "pnpm-testing-utils",
  "pnpr",
@@ -5580,6 +5582,20 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
+]
+
+[[package]]
+name = "pnpm-python-resolver"
+version = "0.0.1"
+dependencies = [
+ "miette 7.6.0",
+ "pep440_rs",
+ "pep508_rs",
+ "pubgrub",
+ "serde",
+ "serde_json",
+ "ssri",
  "url",
 ]
 
@@ -6093,6 +6109,8 @@ dependencies = [
  "mockito",
  "node-semver",
  "object_store",
+ "pep440_rs",
+ "pep508_rs",
  "pipe-trait",
  "pnpm-cargo-resolver",
  "pnpm-catalogs-types",
@@ -6106,6 +6124,7 @@ dependencies = [
  "pnpm-network",
  "pnpm-package-manager",
  "pnpm-package-manifest",
+ "pnpm-python-resolver",
  "pnpm-reporter",
  "pnpm-resolving-npm-resolver",
  "pnpm-resolving-resolver-base",
@@ -6143,6 +6162,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "walkdir",
  "wax",
  "zip",
 ]
