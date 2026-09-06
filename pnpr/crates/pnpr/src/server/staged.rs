@@ -26,8 +26,8 @@ use serde_json::{Value, json};
 
 use super::{
     Action, AppState, AuthedCaller, Identity, RegistrySource, TargetRegistry, authorize,
-    commit_publishes, json_response, not_found, private_no_cache, resolve_write_target,
-    stage_publish, validate_publish_doc,
+    commit_publishes, json_response, not_found, private_no_cache, publishing::report_unrecorded,
+    resolve_write_target, stage_publish, validate_publish_doc,
 };
 use pnpr_error::RegistryError;
 use pnpr_package_name::PackageName;
@@ -394,13 +394,20 @@ async fn serve_staged_approve(
         Ok(staged) => staged,
         Err(err) => return err.into_response(),
     };
-    if let Err(err) = commit_publishes(state, vec![staged]).await {
-        return err.into_response();
-    }
+    let outcome = match commit_publishes(state, vec![staged]).await {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_response(),
+    };
+    // Past the commit the stage is spent, whatever the transaction could not
+    // record: leaving the record listed would offer an approval that cannot
+    // happen again.
     if let Err(err) = state.inner.storage.remove_staged(stage_id).await {
         // The publish is already committed and visible; a failed record
         // cleanup must not report the approval as failed.
         tracing::warn!(error = %err, stage_id, "approved staged publish but its record cleanup failed");
+    }
+    if let Err(err) = report_unrecorded(outcome) {
+        return err.into_response();
     }
     json_response(StatusCode::CREATED, &json!({ "ok": true }))
 }
